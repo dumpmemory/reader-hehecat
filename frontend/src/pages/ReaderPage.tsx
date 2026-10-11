@@ -255,6 +255,12 @@ export default function ReaderPage() {
   }, []);
 
   const [immersive, setImmersive] = React.useState(false);
+
+  // 点击正文中央/空白: 收起上下工具条让正文占满全屏 (不持久化——进章保持, 刷新恢复常显)
+  const [chromeHidden, setChromeHidden] = React.useState(false);
+  const handleToggleChrome = React.useCallback(() => {
+    setChromeHidden((prev) => !prev);
+  }, []);
   React.useEffect(() => {
     const onFullscreenChange = () => {
       setImmersive(document.fullscreenElement !== null);
@@ -587,6 +593,7 @@ export default function ReaderPage() {
           onToggleImmersive={handleToggleImmersive}
           onOpenToc={handleOpenToc}
           onOpenSettings={handleOpenSettings}
+          chromeHidden={chromeHidden}
         />
 
         {/* 正文容器: 加入书签时扫描其中带 data-pos 的段落取可视区首段作摘要; 划选工具条也只认这个容器内的选区 */}
@@ -619,6 +626,7 @@ export default function ReaderPage() {
                 ? handleGoToSources
                 : undefined
             }
+            onToggleChrome={handleToggleChrome}
           />
         </div>
 
@@ -627,6 +635,7 @@ export default function ReaderPage() {
           index={progress.index}
           onGoToChapter={goToChapter}
           onOpenBookmarks={handleOpenBookmarks}
+          chromeHidden={chromeHidden}
         />
       </div>
 

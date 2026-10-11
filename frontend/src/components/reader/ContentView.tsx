@@ -611,6 +611,8 @@ function FullScrollList({
 interface ScrollModeProps extends ScrollListProps {
   onPrevChapter: () => void;
   onNextChapter: () => void;
+  /** 点正文: 切换上下工具条 */
+  onToggleChrome?: () => void;
 }
 
 function ScrollMode({
@@ -628,6 +630,7 @@ function ScrollMode({
   onScrollerReady,
   onPrevChapter,
   onNextChapter,
+  onToggleChrome,
 }: ScrollModeProps) {
   const handleArrow = React.useCallback(
     (delta: number) => {
@@ -640,6 +643,9 @@ function ScrollMode({
     [onPrevChapter, onNextChapter],
   );
   useArrowKeys(handleArrow);
+
+  // 滚动模式没有边缘翻页区, 任意有效 tap (非控件/无选区/非拖拽) 都切换上下工具条
+  const tapProps = useTapZone(() => onToggleChrome?.());
 
   const listProps: ScrollListProps = {
     items,
@@ -657,7 +663,7 @@ function ScrollMode({
   };
 
   return (
-    <div className="h-full">
+    <div className="h-full" {...tapProps}>
       {items.length > VIRTUALIZATION_THRESHOLD ? (
         <VirtualScrollList {...listProps} />
       ) : (
@@ -674,6 +680,8 @@ interface PagedModeProps extends ListProps {
   endBlock: ChapterEndBlockProps;
   onPrevChapter: () => void;
   onNextChapter: () => void;
+  /** 点正文中央: 切换上下工具条 (左右/上下边缘留给翻页) */
+  onToggleChrome?: () => void;
 }
 
 /**
@@ -696,6 +704,7 @@ function PagedMode({
   endBlock,
   onPrevChapter,
   onNextChapter,
+  onToggleChrome,
 }: PagedModeProps) {
   const viewportRef = React.useRef<HTMLDivElement>(null);
   const innerRef = React.useRef<HTMLDivElement>(null);
@@ -815,9 +824,12 @@ function PagedMode({
         goPage(page - 1);
       } else if (zone === "next") {
         goPage(page + 1);
+      } else {
+        // 中央区域: 切换上下工具条显隐
+        onToggleChrome?.();
       }
     },
-    [goPage, page],
+    [goPage, page, onToggleChrome],
   );
   const tapProps = useTapZone(handleTap);
 
@@ -1025,6 +1037,8 @@ export interface ContentViewProps {
   onGoToSources?: () => void;
   /** 空正文时的换源救出口 (ReaderPage 弹候选列表) */
   onSwitchSource?: () => void;
+  /** 点击正文中央/空白 (非控件、无选区、非拖拽): 由页面切换上下工具条显隐 */
+  onToggleChrome?: () => void;
 }
 
 /** memo: 顶栏进度条每滚一帧就可能更新一次百分比, 正文子树不必跟着重渲染 */
@@ -1051,6 +1065,7 @@ export const ContentView = React.memo(function ContentView({
   onAutoScrollStop,
   onGoToSources,
   onSwitchSource,
+  onToggleChrome,
 }: ContentViewProps) {
   const indent = useSettingsStore((state) => state.indentParagraph);
   const autoScrollSpeed = useSettingsStore((state) => state.autoScrollSpeed);
@@ -1163,6 +1178,7 @@ export const ContentView = React.memo(function ContentView({
         endBlock={endBlock}
         onPrevChapter={onPrevChapter}
         onNextChapter={onNextChapter}
+        onToggleChrome={onToggleChrome}
       />
     );
   } else {
@@ -1182,6 +1198,7 @@ export const ContentView = React.memo(function ContentView({
         onScrollerReady={setScroller}
         onPrevChapter={onPrevChapter}
         onNextChapter={onNextChapter}
+        onToggleChrome={onToggleChrome}
       />
     );
   }

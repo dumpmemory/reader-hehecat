@@ -69,6 +69,8 @@ export interface ReaderTopBarProps {
   onToggleImmersive: () => void;
   onOpenToc: () => void;
   onOpenSettings: () => void;
+  /** 点击正文隐藏工具条时: 顶栏向上收起 (内容随 flex 自适应扩展) */
+  chromeHidden?: boolean;
 }
 
 /**
@@ -97,9 +99,19 @@ export function ReaderTopBar({
   onToggleImmersive,
   onOpenToc,
   onOpenSettings,
+  chromeHidden = false,
 }: ReaderTopBarProps) {
   return (
-    <header className="ui-safe-t ui-safe-x sticky top-0 z-30 shrink-0 border-b border-border/70 bg-background/85 backdrop-blur">
+    <header
+      aria-hidden={chromeHidden}
+      inert={chromeHidden}
+      className={cn(
+        "ui-safe-t ui-safe-x sticky top-0 z-30 shrink-0 overflow-hidden border-b border-border/70 bg-background/85 backdrop-blur",
+        // 点正文收起/展开: 高度与位移同时过渡, 内容区随之占满全屏(遵守系统减动效偏好)
+        "transition-[height,transform,opacity] duration-300 ease-out motion-reduce:transition-none",
+        chromeHidden ? "h-0 -translate-y-full border-transparent opacity-0" : "h-14",
+      )}
+    >
       {/* 图标多, 小屏收紧间距并降一档按钮尺寸, 保住书名/章节的展示宽度 */}
       <div className="mx-auto flex h-14 max-w-3xl items-center gap-0.5 px-2 sm:gap-2 sm:px-4">
         <IconButton variant="ghost" tooltip="返回" tooltipSide="bottom" onClick={onBack}>
@@ -226,6 +238,8 @@ export interface ReaderChapterBarProps {
   onGoToChapter: (index: number) => void;
   /** 打开书签抽屉 */
   onOpenBookmarks: () => void;
+  /** 点击正文隐藏工具条时: 底栏向下收起 */
+  chromeHidden?: boolean;
 }
 
 /**
@@ -237,6 +251,7 @@ export function ReaderChapterBar({
   index,
   onGoToChapter,
   onOpenBookmarks,
+  chromeHidden = false,
 }: ReaderChapterBarProps) {
   const theme = useSettingsStore((state) => state.theme);
   const setTheme = useSettingsStore((state) => state.setTheme);
@@ -273,13 +288,26 @@ export function ReaderChapterBar({
   );
 
   return (
-    <footer className="ui-safe-b ui-safe-x relative z-30 shrink-0 border-t border-border/70 bg-background/85 backdrop-blur">
+    <footer
+      aria-hidden={chromeHidden}
+      inert={chromeHidden}
+      className={cn(
+        "ui-safe-b ui-safe-x relative z-30 shrink-0 border-t border-border/70 bg-background/85 backdrop-blur",
+        chromeHidden && "border-transparent",
+      )}
+    >
       {activeChapter === undefined ? null : (
         <p className="pointer-events-none absolute bottom-full left-1/2 mb-2 w-max max-w-[80vw] -translate-x-1/2 truncate rounded-md bg-foreground px-2.5 py-1 text-xs text-background shadow-lg">
           {activeChapter.title}
         </p>
       )}
-      <div className="mx-auto flex max-w-3xl items-center gap-1 px-2 py-1.5">
+      <div
+        className={cn(
+          "overflow-hidden transition-[max-height,opacity] duration-300 ease-out motion-reduce:transition-none",
+          chromeHidden ? "max-h-0 opacity-0" : "max-h-32",
+        )}
+      >
+        <div className="mx-auto flex max-w-3xl items-center gap-1 px-2 py-1.5">
         <IconButton
           variant="ghost"
           size="sm"
@@ -323,7 +351,8 @@ export function ReaderChapterBar({
           onClick={() => setTheme(isDark ? "light" : "dark")}
         >
           {isDark ? <Sun /> : <Moon />}
-        </IconButton>
+          </IconButton>
+        </div>
       </div>
     </footer>
   );
