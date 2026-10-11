@@ -143,7 +143,8 @@ compose 默认挂 `deploy/storage/`(容器内 `/storage/storage`), 内含:
 | `READER_DB_BACKUP` | 1 | 启动前 db 快照开关(0 关) |
 | `READER_AUTO_BACKUP_HOUR` | 3 | 每日 WebDAV zip 备份时刻(0-23) |
 | `READER_HTTP_RETRIES` | 2 | 搜索/抓取单源重试次数(compose 默认 1, 死源排空更快) |
-| `SSRF_ALLOW_PRIVATE` | false | 允许抓内网地址(本地书同步/内网 TTS 需要) |
+| `SSRF_ALLOW_PRIVATE` | false | 图片代理/TTS/登录检测允许私网地址(内网 TTS 等自建场景) |
+| `READER_ALLOW_PRIVATE_SOURCE` | false | 书源抓取允许私网/回环地址(局域网书源、本地测试源才开; 默认拦截防 SSRF) |
 | `READER_DICT_ONLINE` | 1 | 词典在线兜底开关(本地未命中时有道查询, 缓存 30 天) |
 | `READER_DICT_DIR` | /app/dict | 离线词典原始数据目录(ecdict.csv / word.json / ci.json / idiom.json) |
 | `READER_CAMOUFOX_URL` | - | 外置 camoufox 服务地址; 缺省容器内自 spawn |

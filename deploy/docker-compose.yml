@@ -18,7 +18,8 @@ services:
       READER_APP_WORKDIR: /storage
       READER_APP_WEB_ROOT: /app/web-ui/dist
       # 书源抓取允许内网地址 (本地书同步等)
-      SSRF_ALLOW_PRIVATE: "true"
+      SSRF_ALLOW_PRIVATE: "${SSRF_ALLOW_PRIVATE:-false}"        # 图片/TTS/登录检测放行私网(自建部署)
+      READER_ALLOW_PRIVATE_SOURCE: "${READER_ALLOW_PRIVATE_SOURCE:-false}"  # 书源抓取放行私网(局域网/本地书源才开)
       # 搜索抓取重试次数(死源排空速度); 源站普遍慢时可下调
       READER_HTTP_RETRIES: "1"
       READER_BROWSER_FIRST: "0"

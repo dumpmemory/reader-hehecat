@@ -335,6 +335,16 @@ fn ssrf_redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
+/// 书源抓取专用重定向策略（逐跳校验，只受 `SOURCE_ALLOW_PRIVATE` 控制）
+fn source_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        match validate_source_redirect_target(attempt.url().as_str()) {
+            Ok(()) => attempt.follow(),
+            Err(e) => attempt.error(e),
+        }
+    })
+}
+
 /// EG5：按代理串缓存的直连 Client（reqwest Client 内置连接池/TLS 会话——每次请求重建
 /// 开销大；不同代理各自实例）。上限防呆：超限整体清空重建（书源级代理数量级很小，
 /// 正常不会触达）。
@@ -353,7 +363,7 @@ fn proxy_http_client(proxy_url: &str) -> Result<reqwest::Client> {
     {
         return Ok(c.clone()); // Client 内部 Arc，clone 廉价
     }
-    let client = build_http_client(0, ssrf_redirect_policy(), Some(&key))?;
+    let client = build_http_client(0, source_redirect_policy(), Some(&key))?;
     let mut m = PROXY_CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
     if m.len() >= PROXY_CLIENT_CACHE_MAX {
         m.clear();
@@ -518,15 +528,15 @@ pub async fn fetch(
     charset: Option<&str>,
     proxy: Option<&str>,
 ) -> Result<FetchResponse> {
-    // 入口目标校验（DNS 解析后——拒绝私网/回环/169.254 等）
-    validate_public_target(url).await?;
+    // 入口目标校验（DNS 解析后——拒绝私网/回环/169.254 等；书源专用开关控制）
+    validate_source_target(url).await?;
     // EG5：书源级代理 → 共享代理 Client（按代理串缓存）；否则按次构建直连 Client
     let client = match proxy.map(str::trim).filter(|p| !p.is_empty()) {
         Some(p) => {
             tracing::debug!("http_fetch 走书源级代理 {p} {method} {url}");
             proxy_http_client(p)?
         }
-        None => http_client_builder(timeout_secs, ssrf_redirect_policy())?,
+        None => http_client_builder(timeout_secs, source_redirect_policy())?,
     };
     let retries = http_retry_count();
     let mut last_err: Option<anyhow::Error> = None;
@@ -691,6 +701,11 @@ pub async fn fetch_image(
 /// 生产代码不读环境变量、无配置入口——所有请求强制校验。
 pub static SSRF_ALLOW_PRIVATE: AtomicBool = AtomicBool::new(false);
 
+/// 书源抓取专用放行开关（`READER_ALLOW_PRIVATE_SOURCE=1`）：独立于全局
+/// `SSRF_ALLOW_PRIVATE`，默认关——书源规则(search/toc/正文/换源/订阅)不可访问
+/// 私网/回环地址，即使全局已为内网 TTS/本地同步放行。
+pub static SOURCE_ALLOW_PRIVATE: AtomicBool = AtomicBool::new(false);
+
 /// 测试互斥锁：所有读写 `SSRF_ALLOW_PRIVATE` 的测试持同一把锁（串行），
 /// 避免并行测试互相干扰（放行态与拦截态断言互斥）。
 #[cfg(test)]
@@ -754,6 +769,19 @@ pub fn validate_redirect_target(url: &str) -> Result<()> {
     if SSRF_ALLOW_PRIVATE.load(Ordering::Relaxed) {
         return Ok(());
     }
+    validate_redirect_target_strict(url)
+}
+
+/// 书源抓取专用重定向校验：只受 `SOURCE_ALLOW_PRIVATE` 控制
+pub fn validate_source_redirect_target(url: &str) -> Result<()> {
+    if SOURCE_ALLOW_PRIVATE.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    validate_redirect_target_strict(url)
+}
+
+/// 严格版（不看任何放行开关）
+fn validate_redirect_target_strict(url: &str) -> Result<()> {
     let parsed = url::Url::parse(url).map_err(|e| anyhow!("重定向目标 URL 非法: {e}"))?;
     // 字面 IP 快速路径（不经 DNS——Host::Ipv6 直接判回环，不依赖系统 IPv6 支持）
     match parsed.host() {
@@ -806,6 +834,19 @@ pub async fn validate_public_target(url: &str) -> Result<()> {
     if SSRF_ALLOW_PRIVATE.load(Ordering::Relaxed) {
         return Ok(());
     }
+    validate_target_strict(url).await
+}
+
+/// 书源抓取入口校验：只受 `SOURCE_ALLOW_PRIVATE` 控制（默认拦截私网/回环）
+pub async fn validate_source_target(url: &str) -> Result<()> {
+    if SOURCE_ALLOW_PRIVATE.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    validate_target_strict(url).await
+}
+
+/// 严格版（不看任何放行开关）
+async fn validate_target_strict(url: &str) -> Result<()> {
     let parsed = url::Url::parse(url).map_err(|e| anyhow!("目标 URL 非法: {e}"))?;
     // 字面 IP 快速路径（不经 DNS——Host::Ipv6 直接判回环，不依赖系统 IPv6 支持）
     match parsed.host() {
@@ -1256,7 +1297,7 @@ async fn http_fetch_inner(
     }
     // 浏览器优先路径同样执行 SSRF 入口校验（obscura 侧还默认禁 RFC1918 内网导航，
     // 双保险——否则默认浏览器优先会让私网书源 URL 绕过 fetch 的直连校验）
-    validate_public_target(&url).await?;
+    validate_source_target(&url).await?;
     // ① 书源 cookie + 记录的 UA（FlareSolverr 返回的 UA 绑定 cookie——部分站点校验 UA 一致性）
     let (session_cookie, stored_ua) = session_for(ns, &url).await.unwrap_or_default();
     // E6：cookie 主读路径走 legacy getSubDomain 域键；旧 origin 键会话作回退
