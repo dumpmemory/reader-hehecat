@@ -2699,6 +2699,44 @@ mod tests {
         assert_eq!(bytes, body);
     }
 
+    /// 书源抓取校验独立于全局放行：即使 `SSRF_ALLOW_PRIVATE=true`（内网 TTS/图片场景），
+    /// 书源入口与重定向仍拦截私网/回环——防"全局放行顺带放开书源"导致的 SSRF。
+    #[tokio::test]
+    async fn test_source_target_blocked_even_when_global_allows() {
+        let _g = ssrf_allow_private_guard(true); // 全局放行（持锁）
+        for url in [
+            "http://127.0.0.1:8085/x.png",
+            "http://172.17.0.1:9911/book/1",
+            "http://192.168.1.10/x",
+        ] {
+            assert!(
+                validate_public_target(url).await.is_ok(),
+                "全局放行应生效: {url}"
+            );
+            let err = validate_source_target(url).await.unwrap_err();
+            assert!(err.to_string().contains("已拦截"), "书源应拦截 {url}: {err}");
+            let err2 = validate_source_redirect_target(url).unwrap_err();
+            assert!(
+                err2.to_string().contains("已拦截"),
+                "书源重定向应拦截 {url}: {err2}"
+            );
+        }
+        // 公网目标不受影响
+        assert!(validate_source_target("https://example.com/x").await.is_ok());
+    }
+
+    /// `SOURCE_ALLOW_PRIVATE` 开关：显式放行时书源可访问私网，关闭后恢复拦截
+    #[tokio::test]
+    async fn test_source_allow_private_switch() {
+        let _g = ssrf_allow_private_guard(false); // 持锁 + 全局拦截态
+        let prev = SOURCE_ALLOW_PRIVATE.swap(true, Ordering::Relaxed);
+        let allowed = validate_source_target("http://127.0.0.1:1/x").await.is_ok();
+        SOURCE_ALLOW_PRIVATE.store(prev, Ordering::Relaxed);
+        let blocked = validate_source_target("http://127.0.0.1:1/x").await.is_err();
+        assert!(allowed, "SOURCE_ALLOW_PRIVATE=true 时应放行私网书源");
+        assert!(blocked, "开关关闭后应恢复拦截");
+    }
+
     /// M1 SSRF：私网/回环/链路本地字面 IP 一律拒绝（127.0.0.1、10/8、172.16/12、
     /// 192.168/16、169.254/16、::1、fc00::/7、0.0.0.0、IPv4 映射回环）
     #[tokio::test]

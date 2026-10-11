@@ -9244,7 +9244,7 @@ mod tests {
 
         // 命中两章，按章节序返回
         let hits = storage
-            .search_book_content("local://book1", "关键词", 50)
+            .search_book_content("default", "local://book1", "关键词", 50)
             .await
             .unwrap();
         assert_eq!(hits.len(), 2);
@@ -9262,7 +9262,7 @@ mod tests {
 
         // 其他书不串
         let hits = storage
-            .search_book_content("local://book2", "关键词", 50)
+            .search_book_content("default", "local://book2", "关键词", 50)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -9270,12 +9270,12 @@ mod tests {
 
         // 无命中 / 书不存在
         assert!(storage
-            .search_book_content("local://book1", "不存在词", 50)
+            .search_book_content("default", "local://book1", "不存在词", 50)
             .await
             .unwrap()
             .is_empty());
         assert!(storage
-            .search_book_content("local://ghost", "关键词", 50)
+            .search_book_content("default", "local://ghost", "关键词", 50)
             .await
             .unwrap()
             .is_empty());
@@ -9289,7 +9289,7 @@ mod tests {
             .await
             .unwrap();
         let hits = storage
-            .search_book_content("local://book3", "world", 50)
+            .search_book_content("default", "local://book3", "world", 50)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -9297,7 +9297,7 @@ mod tests {
 
         // limit 生效
         let hits = storage
-            .search_book_content("local://book1", "关键词", 1)
+            .search_book_content("default", "local://book1", "关键词", 1)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -9314,18 +9314,18 @@ mod tests {
             .await
             .unwrap();
         let hits = storage
-            .search_book_content("local://book4", "5_0%", 10)
+            .search_book_content("default", "local://book4", "5_0%", 10)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1, "% 应转义为字面量");
         assert_eq!(hits[0].title, "C1");
         let hits = storage
-            .search_book_content("local://book4", "5_", 10)
+            .search_book_content("default", "local://book4", "5_", 10)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1, "_ 应转义为字面量");
         let hits = storage
-            .search_book_content("local://book4", "%", 10)
+            .search_book_content("default", "local://book4", "%", 10)
             .await
             .unwrap();
         assert_eq!(
@@ -9335,7 +9335,7 @@ mod tests {
         );
         assert_eq!(hits[0].title, "C1");
         let hits = storage
-            .search_book_content("local://book4", "_", 10)
+            .search_book_content("default", "local://book4", "_", 10)
             .await
             .unwrap();
         assert_eq!(
