@@ -382,7 +382,7 @@ export default function PurifyPage() {
               支持本端导出格式与阅读 legacy 导出 ({`{regex, replacement, replaceSummary…}`}); 粘贴 JSON 或选择文件.
             </DialogDescription>
           </DialogHeader>
-          <div className="flex flex-col gap-3">
+          <div className="flex flex-col gap-3 px-4 md:px-5">
             <div className="flex items-center gap-2">
               <Button size="sm" variant="secondary" onClick={() => fileRef.current?.click()}>
                 选择 JSON 文件

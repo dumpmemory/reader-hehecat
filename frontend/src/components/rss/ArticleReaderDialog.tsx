@@ -81,7 +81,7 @@ export function ArticleReaderDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="min-h-0 flex-1 overflow-y-auto md:px-1">
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 md:px-5">
           {content.isLoading ? (
             <div className="flex flex-col items-center justify-center gap-2 py-16 text-sm text-muted-foreground">
               <Spinner />

@@ -779,7 +779,7 @@ export default function SourcesPage() {
               禁用后不再参与搜索排序与轮次; 随时可在列表重新启用.
             </DialogDescription>
           </DialogHeader>
-          <ul className="max-h-56 overflow-y-auto text-xs text-muted-foreground">
+          <ul className="max-h-56 overflow-y-auto px-4 text-xs text-muted-foreground md:px-5">
             {cleanupTargets.map((source) => (
               <li key={source.bookSourceUrl} className="truncate py-1">
                 {source.bookSourceName || source.bookSourceUrl} · {source.bookSourceUrl}

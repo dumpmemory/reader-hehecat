@@ -240,7 +240,7 @@ export function EditRssSourceDialog({
         <Tabs
           value={tab}
           onValueChange={setTab}
-          className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto md:overflow-visible"
+          className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 md:overflow-visible md:px-5"
         >
           <TabsList className="shrink-0 self-start">
             <TabsTrigger value="form">表单</TabsTrigger>
@@ -430,7 +430,7 @@ export function EditRssSourceDialog({
         </Tabs>
 
         {tab === "form" && jsonError !== null ? (
-          <p role="alert" className="text-xs text-danger">
+          <p role="alert" className="px-4 text-xs text-danger md:px-5">
             JSON 页有未修正的错误: {jsonError}
           </p>
         ) : null}
