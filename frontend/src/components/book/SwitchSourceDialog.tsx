@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
+import { SearchMatchMode } from "@/components/search/SearchMatchMode";
 
 import {
   Button,
@@ -61,6 +62,8 @@ export function SwitchSourceDialog({
   const bookUrl = book?.bookUrl ?? "";
   /** 缓存候选可能过期/为空: 允许用全部书源重新搜索一次(慢) */
   const [forceSearch, setForceSearch] = React.useState(false);
+  const [exact, setExact] = React.useState(true);
+  const probeRun = React.useRef(0);
   /** 本章比对: bookUrl → 结果(章节名+字数 / 缺章 / 失败) */
   const [probes, setProbes] = React.useState<Record<string, ChapterProbe>>({});
   const [probeProgress, setProbeProgress] = React.useState<{ done: number; total: number } | null>(
@@ -69,20 +72,43 @@ export function SwitchSourceDialog({
   const probeAbort = React.useRef(false);
 
   const candidates = useQuery({
-    queryKey: ["switchCandidates", bookUrl, forceSearch],
-    queryFn: () => getAvailableBookSource(bookUrl, forceSearch),
+    queryKey: ["switchCandidates", bookUrl, exact, forceSearch],
+    queryFn: ({ signal }) => getAvailableBookSource(bookUrl, forceSearch, { signal }, exact),
+    retry: false,
     // 未入架且无引导入口时不必发请求(后端只会报「书籍信息错误」)
     enabled: open && bookUrl !== "" && (inShelf || onAddToShelf !== undefined),
   });
 
-  React.useEffect(() => {
-    if (!open) {
-      setForceSearch(false);
+  React.useLayoutEffect(() => {
+    const run = ++probeRun.current;
+    probeAbort.current = true;
+    queueMicrotask(() => {
+      if (run !== probeRun.current) return;
       setProbes({});
       setProbeProgress(null);
-      probeAbort.current = false;
-    }
-  }, [open]);
+      if (!open) {
+        setForceSearch(false);
+        setExact(true);
+      }
+    });
+    return () => { probeRun.current += 1; probeAbort.current = true; };
+  }, [open, bookUrl, exact, forceSearch, chapterIndex, chapterTitle]);
+
+  const changeMatchMode = (nextExact: boolean) => {
+    probeRun.current += 1;
+    probeAbort.current = true;
+    setForceSearch(false);
+    setExact(nextExact);
+  };
+
+  const refreshCandidates = () => {
+    probeRun.current += 1;
+    probeAbort.current = true;
+    setProbes({});
+    setProbeProgress(null);
+    if (forceSearch) void candidates.refetch();
+    else setForceSearch(true);
+  };
 
   const applySwitch = useMutation({
     mutationFn: (candidate: AvailableBookSource) =>
@@ -120,12 +146,13 @@ export function SwitchSourceDialog({
       return;
     }
     probeAbort.current = false;
+    const run = ++probeRun.current;
     setProbeProgress({ done: 0, total: list.length });
     const results: Record<string, ChapterProbe> = {};
     let cursor = 0;
     let done = 0;
     const worker = async () => {
-      while (!probeAbort.current) {
+      while (!probeAbort.current && run === probeRun.current) {
         const i = cursor;
         cursor += 1;
         if (i >= list.length) {
@@ -136,7 +163,8 @@ export function SwitchSourceDialog({
           return;
         }
         try {
-          const toc = await getChapterList(candidate.bookUrl);
+          const toc = await getChapterList(candidate.bookUrl, false, { bookSourceUrl: candidate.origin });
+          if (run !== probeRun.current || probeAbort.current) return;
           const match = matchChapter(chapterTitle ?? "", chapterIndex, toc);
           if (match.chapter === undefined) {
             results[candidate.bookUrl] = { missing: "缺少本章" };
@@ -144,6 +172,8 @@ export function SwitchSourceDialog({
             const target = match.chapter;
             const content = await getBookContent(target.url, target.index, {
               bookSourceUrl: candidate.origin,
+              bookUrl: candidate.bookUrl,
+              cache: true,
             });
             results[candidate.bookUrl] = {
               kind: match.kind,
@@ -154,12 +184,14 @@ export function SwitchSourceDialog({
         } catch {
           results[candidate.bookUrl] = { missing: "检测失败" };
         }
+        if (run !== probeRun.current || probeAbort.current) return;
         done += 1;
         setProbes({ ...results });
         setProbeProgress({ done, total: list.length });
       }
     };
     await Promise.all(Array.from({ length: Math.min(3, list.length) }, worker));
+    if (run !== probeRun.current) return;
     probeAbort.current = false;
     setProbeProgress(null);
   }, [candidates.data, chapterIndex, chapterTitle, probeProgress]);
@@ -206,6 +238,15 @@ export function SwitchSourceDialog({
             {chapterTitle ? ` ${chapterTitle}` : ""}
           </DialogDescription>
         </DialogHeader>
+        <div className="space-y-2 px-4 pb-3 md:px-5">
+          <SearchMatchMode exact={exact} onChange={changeMatchMode} disabled={applySwitch.isPending} />
+          <p className="text-xs text-muted-foreground">
+            {exact ? "完整匹配书名；请核对候选作者" : "模糊匹配书名，可能包含不同作品；请核对书名和作者"}
+          </p>
+          <Button size="sm" variant="secondary" loading={candidates.isFetching} onClick={refreshCandidates} disabled={!inShelf || applySwitch.isPending}>
+            {exact ? "重新搜索书源" : "用全部书源模糊搜索"}
+          </Button>
+        </div>
         {canProbe ? (
           <div className="flex items-center justify-between gap-3 px-4 pb-1 md:px-5">
             <span className="min-w-0 truncate text-xs text-muted-foreground">
@@ -235,30 +276,30 @@ export function SwitchSourceDialog({
             </div>
           ) : candidates.isLoading || candidates.isFetching ? (
             <p className="py-6 text-center text-sm text-muted-foreground">
-              {forceSearch ? "正在用全部书源搜索(约 30-60 秒)…" : "正在获取候选书源…"}
+              {forceSearch ? "正在重新搜索书源(最多约 60 秒)…" : "正在获取候选书源…"}
+            </p>
+          ) : candidates.isError ? (
+            <p className="py-6 text-center text-sm text-danger">
+              {humanizeError(errorMessage(candidates.error, "读取候选失败，请重新搜索"))}
             </p>
           ) : list.length === 0 ? (
             <div className="flex flex-col items-center gap-3 py-6 text-center text-sm text-muted-foreground">
-              <p>{forceSearch ? "没有找到其它书源的同名书" : "暂无其他可用书源"}</p>
-              {forceSearch ? null : (
-                <Button size="sm" variant="secondary" onClick={() => setForceSearch(true)}>
-                  用全部书源重新搜索
-                </Button>
-              )}
+              <p>{forceSearch ? "没有找到符合当前匹配方式的书" : "当前模式暂无候选，请点击重新搜索"}</p>
             </div>
           ) : (
             <>
               <div className="divide-y divide-border/70">
                 {list.map((candidate) => (
                   <button
-                    key={candidate.bookUrl}
+                    key={`${candidate.bookUrl}|${candidate.origin}`}
                     type="button"
                     disabled={applySwitch.isPending}
                     onClick={() => applySwitch.mutate(candidate)}
                     className="flex w-full cursor-pointer items-center justify-between gap-3 py-3 text-left text-sm hover:text-accent disabled:opacity-50"
                   >
                     <span className="min-w-0 truncate">
-                      {candidate.originName || candidate.origin}
+                      <span className="block truncate">{candidate.name} · {candidate.author || "佚名"}</span>
+                      <span className="block truncate text-xs text-muted-foreground">{candidate.originName || candidate.origin}</span>
                     </span>
                     <span className="min-w-0 max-w-[55%] shrink-0 truncate text-right text-xs text-muted-foreground">
                       {rowDetail(candidate)}
@@ -266,13 +307,6 @@ export function SwitchSourceDialog({
                   </button>
                 ))}
               </div>
-              {forceSearch ? null : (
-                <div className="pb-3 pt-2 text-center">
-                  <Button size="sm" variant="ghost" onClick={() => setForceSearch(true)}>
-                    没找到? 用全部书源重新搜索
-                  </Button>
-                </div>
-              )}
             </>
           )}
         </div>

@@ -170,11 +170,12 @@ export async function getAvailableBookSource(
   bookUrl: string,
   refresh = false,
   config?: ApiRequestConfig,
+  exact = true,
 ): Promise<AvailableBookSource[]> {
   const data = await post<unknown>(
     "/getAvailableBookSource",
-    { url: bookUrl, refresh: refresh ? 1 : 0 },
-    config,
+    { url: bookUrl, refresh: refresh ? 1 : 0, exact: exact ? 1 : 0 },
+    { timeout: 120_000, ...config },
   );
   return parseWith(availableBookSourceListSchema, data);
 }

@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { getBookInfo } from "@/services/book";
 import { stripNullsDeep } from "@/lib/api-client";
+import { matchesSearchKey, normalizeSearchText, searchTarget } from "@/lib/search-match";
 import { connectSSE } from "@/lib/sse";
 import { searchSSEBatchSchema } from "@/services/search";
 import { getBookSourcesLite } from "@/services/sources";
@@ -18,6 +19,7 @@ export interface SearchProgress {
 }
 
 export interface StartSearchOptions {
+  exact?: boolean;
   /** 并发搜索的书源数, 缺省用后端默认值 */
   concurrentCount?: number;
   /** 起始书源下标, 缺省 -1(从头开始); loadMore 内部用最后的 lastIndex 续搜 */
@@ -41,8 +43,10 @@ export interface UseSearchSSEResult {
   loadMore: () => void;
   /** 已搜到的书源游标 (快照保存用) */
   lastIndex: number;
+  activeKey: string | null;
+  activeExact: boolean;
   /** 会话快照恢复: 以已聚合结果直接进入「已停止」态, 不重新起搜 */
-  hydrate: (key: string, items: SearchBook[], fromIndex: number) => void;
+  hydrate: (key: string, items: SearchBook[], fromIndex: number, exact?: boolean) => void;
 }
 /** 单连接一次搜全部源(对齐 app 版): 分窗+每次重算源列表会让游标漂移,
  * 死源区间实测每窗只推进 1 个源(30s×5 窗才走 5 个) —— 改为一次连接边搜边推, 直到搜完 */
@@ -70,13 +74,13 @@ interface Accumulator {
 
 /** 相关性分级: 0 书名完全匹配 → 1 书名包含 → 2 作者包含 → 3 简介包含 → 4 其余字段命中 */
 export function searchRelevance(book: SearchBook, keyword: string): number {
-  const kw = keyword.trim().toLowerCase();
+  const kw = normalizeSearchText(searchTarget(keyword).key);
   if (kw.length === 0) {
     return 4;
   }
-  const name = book.name.trim().toLowerCase();
-  const author = book.author.trim().toLowerCase();
-  const intro = (book.intro ?? "").toLowerCase();
+  const name = normalizeSearchText(book.name);
+  const author = normalizeSearchText(book.author);
+  const intro = normalizeSearchText(book.intro ?? "");
   if (name === kw) return 0;
   if (name.includes(kw)) return 1;
   if (author.includes(kw)) return 2;
@@ -143,18 +147,6 @@ function mergeBook(acc: Accumulator, book: SearchBook): boolean {
  * 聚合前按「书名/作者/简介包含关键词的全部空白分词」收口, 搜「大主宰」不再混入
  * 「山村小神医」这类三者都不沾边的结果; 按作者搜或换名但简介含关键词的书同样保留.
  */
-function matchesSearchKey(book: SearchBook, key: string): boolean {
-  const tokens = key
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((token) => token.length > 0);
-  if (tokens.length === 0) {
-    return true;
-  }
-  const haystack = `${book.name}\u0000${book.author ?? ""}\u0000${book.intro ?? ""}`.toLowerCase();
-  return tokens.every((token) => haystack.includes(token));
-}
-
 function mergeBatch(acc: Accumulator, batch: readonly SearchBook[]): boolean {
   let changed = false;
   for (const book of batch) {
@@ -172,6 +164,10 @@ export function useSearchSSE(): UseSearchSSEResult {
   const [error, setError] = useState<string | null>(null);
   const [lastIndex, setLastIndex] = useState(-1);
   const [activeKey, setActiveKey] = useState<string | null>(null);
+  const [activeExact, setActiveExact] = useState(false);
+  const exactRef = useRef(false);
+  const scopeRef = useRef(0);
+  const connectionRef = useRef(0);
 
   const accRef = useRef<Accumulator>({ items: [], seen: new Set(), entries: new Map() });
   const cancelRef = useRef<(() => void) | null>(null);
@@ -181,7 +177,7 @@ export function useSearchSSE(): UseSearchSSEResult {
   const lastIndexRef = useRef(-1);
   const concurrentRef = useRef<number | undefined>(undefined);
   const searchingRef = useRef(false);
-  searchingRef.current = searching;
+  useLayoutEffect(() => { searchingRef.current = searching; }, [searching]);
   /** 自动续搜: 每连接只搜 searchSize 个源, 流结束后自动接下一批直到搜完/手动停止 */
   const autoRef = useRef(true);
   /** 服务端「没有更多了」= 搜完收口信号 (error 事件载荷); state 镜像供 hasMore 渲染 */
@@ -222,12 +218,13 @@ export function useSearchSSE(): UseSearchSSEResult {
         continue;
       }
       inflightRef.current += 1;
+      const scope = scopeRef.current;
       void getBookInfo({ url: item.bookUrl, bookSourceUrl: item.origin }, { timeout: 8_000 })
         .then((info) => (info.intro ?? "").trim())
         .catch(() => "")
         .then((intro) => {
           inflightRef.current -= 1;
-          if (intro.length > 0) {
+          if (intro.length > 0 && scope === scopeRef.current) {
             introCache.set(bookUrl, intro);
             for (const agg of accRef.current.entries.values()) {
               if (agg.book.bookUrl === bookUrl) {
@@ -241,7 +238,7 @@ export function useSearchSSE(): UseSearchSSEResult {
         });
     }
   }, []);
-  pumpEnrichRef.current = pumpEnrich;
+  useLayoutEffect(() => { pumpEnrichRef.current = pumpEnrich; }, [pumpEnrich]);
 
   /** 把缺简介的结果按当前相关性序入队 (顶部卡片优先补) */
   const enqueueEnrich = useCallback(() => {
@@ -274,6 +271,7 @@ export function useSearchSSE(): UseSearchSSEResult {
   );
 
   const connect = useCallback((key: string, fromIndex: number, concurrentCount?: number) => {
+    const connection = ++connectionRef.current;
     // 切换关键词/重搜前必须断开旧连接
     cancelRef.current?.();
     cancelRef.current = null;
@@ -284,12 +282,14 @@ export function useSearchSSE(): UseSearchSSEResult {
     setActiveKey(key);
     setLastIndex(fromIndex);
     setSearching(true);
+    searchingRef.current = true;
     setError(null);
 
     cancelRef.current = connectSSE(
       "/reader3/searchBookMultiSSE",
       {
         key,
+        exact: exactRef.current ? 1 : 0,
         lastIndex: fromIndex,
         concurrentCount: concurrentCount ?? 24,  // 实测 24 是本机出口的流畅上限(32 会壅塞)
         searchSize: SEARCH_WINDOW,
@@ -298,6 +298,7 @@ export function useSearchSSE(): UseSearchSSEResult {
       },
       {
         onData: (payload) => {
+          if (connection !== connectionRef.current) return;
           // warp serde 对 SearchBook 的 Option 字段显式输出 null, 先归一再进 zod
           const parsed = searchSSEBatchSchema.safeParse(stripNullsDeep(payload));
           if (!parsed.success) {
@@ -309,7 +310,7 @@ export function useSearchSSE(): UseSearchSSEResult {
           lastIndexRef.current = nextIndex;
           setLastIndex(nextIndex);
           const relevant = parsed.data.data.filter((item) =>
-            matchesSearchKey(item, keyRef.current ?? ""),
+            matchesSearchKey(item, keyRef.current ?? "", exactRef.current),
           );
           if (mergeBatch(accRef.current, relevant)) {
             setResults(rankResults(accRef.current.items, keyRef.current ?? ""));
@@ -317,6 +318,7 @@ export function useSearchSSE(): UseSearchSSEResult {
           }
         },
         onEnd: (payload) => {
+          if (connection !== connectionRef.current) return;
           // 服务端提前收口的续接点(未完成源起点 - 1): 优先于批次游标, 保证不漏源;
           // 收口与续搜统一在 onClose 处理 (end/error/中断都会走到)
           const cursor = (payload as { lastIndex?: unknown } | null)?.lastIndex;
@@ -325,6 +327,7 @@ export function useSearchSSE(): UseSearchSSEResult {
           }
         },
         onError: (err) => {
+          if (connection !== connectionRef.current) return;
           cancelRef.current = null;
           if (err.message.includes("没有更多")) {
             noMoreRef.current = true;
@@ -338,11 +341,14 @@ export function useSearchSSE(): UseSearchSSEResult {
           }
         },
         onClose: () => {
+          if (connection !== connectionRef.current) return;
+          searchingRef.current = false;
           if (!autoRef.current || keyRef.current === null || noMoreRef.current) {
             setSearching(false);
             return;
           }
           window.setTimeout(() => {
+            if (connection !== connectionRef.current) return;
             if (!autoRef.current || keyRef.current === null || noMoreRef.current) {
               setSearching(false);
               return;
@@ -376,16 +382,21 @@ export function useSearchSSE(): UseSearchSSEResult {
     );
   }, [enqueueEnrich]);
 
-  connectRef.current = connect;
+  useLayoutEffect(() => { connectRef.current = connect; }, [connect]);
 
   const start = useCallback(
     (key: string, opts?: StartSearchOptions) => {
-      const trimmed = key.trim();
+      const target = searchTarget(key, opts?.exact);
+      const trimmed = target.key;
       if (trimmed.length === 0) {
         setError("请输入搜索关键词");
         return;
       }
       accRef.current = { items: [], seen: new Set(), entries: new Map() };
+      scopeRef.current += 1;
+      exactRef.current = target.exact;
+      setActiveExact(target.exact);
+      endCursorRef.current = null;
       enrichedRef.current = new Set();
       enrichQueueRef.current = [];
       autoRef.current = true;
@@ -400,10 +411,14 @@ export function useSearchSSE(): UseSearchSSEResult {
   );
 
   const stop = useCallback(() => {
+    connectionRef.current += 1;
+    scopeRef.current += 1;
+    enrichQueueRef.current = [];
     autoRef.current = false;
     cancelRef.current?.();
     cancelRef.current = null;
     setSearching(false);
+    searchingRef.current = false;
   }, []);
 
   const loadMore = useCallback(() => {
@@ -419,11 +434,20 @@ export function useSearchSSE(): UseSearchSSEResult {
 
   /** 会话快照恢复: 阅读器预览返回后保留原搜索列表, 不重新起搜 */
   const hydrate = useCallback(
-    (key: string, items: SearchBook[], fromIndex: number) => {
+    (key: string, items: SearchBook[], fromIndex: number, exact = false) => {
+      connectionRef.current += 1;
+      scopeRef.current += 1;
+      const target = searchTarget(key, exact);
+      exactRef.current = target.exact;
+      setActiveExact(target.exact);
+      autoRef.current = false;
+      noMoreRef.current = false;
+      setNoMore(false);
+      endCursorRef.current = null;
       cancelRef.current?.();
       cancelRef.current = null;
       // 旧快照可能存于过滤规则上线前: 恢复时同样收口
-      const clean = items.filter((item) => matchesSearchKey(item, key));
+      const clean = items.filter((item) => matchesSearchKey(item, target.key, target.exact));
       const seen = new Set<string>();
       const entries = new Map<string, { index: number; book: SearchBook }>();
       clean.forEach((item, index) => {
@@ -433,11 +457,12 @@ export function useSearchSSE(): UseSearchSSEResult {
       accRef.current = { items: clean, seen, entries };
       enrichedRef.current = new Set();
       enrichQueueRef.current = [];
-      keyRef.current = key;
+      keyRef.current = target.key;
       lastIndexRef.current = fromIndex;
-      setActiveKey(key);
+      setActiveKey(target.key);
       setLastIndex(fromIndex);
       setSearching(false);
+      searchingRef.current = false;
       setError(null);
       setResults(clean);
     },
@@ -447,6 +472,9 @@ export function useSearchSSE(): UseSearchSSEResult {
   // 离开页面自动断开
   useEffect(
     () => () => {
+      connectionRef.current += 1;
+      scopeRef.current += 1;
+      enrichQueueRef.current = [];
       autoRef.current = false;
       cancelRef.current?.();
       cancelRef.current = null;
@@ -472,5 +500,5 @@ export function useSearchSSE(): UseSearchSSEResult {
     return lastIndex < sourceCount - 1;
   }, [activeKey, noMore, lastIndex, sourceCount]);
 
-  return { results, searching, progress, error, hasMore, start, stop, loadMore, hydrate, lastIndex };
+  return { results, searching, progress, error, hasMore, start, stop, loadMore, hydrate, lastIndex, activeKey, activeExact };
 }

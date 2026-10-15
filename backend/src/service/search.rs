@@ -1070,6 +1070,34 @@ pub(crate) fn filter_exact(books: Vec<SearchBook>, key: &str) -> Vec<SearchBook>
     books.into_iter().filter(|b| exact_match(b, key)).collect()
 }
 
+pub(crate) fn matches_search(book: &SearchBook, key: &str, exact: bool) -> bool {
+    if exact {
+        return exact_match(book, key);
+    }
+    let query = normalize_search_text(key);
+    let fields = [
+        normalize_search_text(&book.name),
+        normalize_search_text(&book.author),
+        normalize_search_text(book.intro.as_deref().unwrap_or_default()),
+    ];
+    query
+        .split_whitespace()
+        .all(|token| fields.iter().any(|field| field.contains(token)))
+}
+
+pub(crate) fn matches_source_title(book: &SearchBook, title: &str, exact: bool) -> bool {
+    let name = normalize_search_text(&book.name);
+    let title = normalize_search_text(title);
+    if name.is_empty() || title.is_empty() {
+        return false;
+    }
+    if exact {
+        name == title
+    } else {
+        name.contains(&title) || title.contains(&name)
+    }
+}
+
 /// CSS 书单：链式 CSS（legado）→ 元素 html 列表
 /// JS 书单规则（legado `<js>代码</js>` 或 `@js:代码`——eval 返回 JSON 数组，每项为书对象）
 fn js_book_list(rule: &str, body: &str, base_url: &str, bridge: Option<&JsBridge>) -> Vec<String> {
@@ -1918,6 +1946,37 @@ mod tests {
         // 无命中
         let hit = filter_exact(books, "不存在的书");
         assert!(hit.is_empty());
+    }
+
+    #[test]
+    fn test_search_matching_modes() {
+        let book = SearchBook {
+            name: "Ｂｏｏｋ ABC（完整版）".into(),
+            author: "测试作者".into(),
+            intro: Some("这是一本 Fantasy 小说".into()),
+            ..Default::default()
+        };
+        assert!(matches_search(&book, "book abc", false));
+        assert!(matches_search(&book, "ＡＢＣ 作者 fantasy", false));
+        assert!(!matches_search(&book, "abc missing", false));
+        assert!(!matches_search(&book, "book abc", true));
+        assert!(matches_search(&book, "测试作者", true));
+        assert!(!matches_search(&book, "fantasy", true));
+        assert!(matches_source_title(&book, "book abc", false));
+        assert!(!matches_source_title(&book, "book abc", true));
+        assert!(!matches_source_title(&book, "测试作者", true));
+        assert!(!matches_source_title(&SearchBook::default(), "书名", false));
+        assert!(!matches_source_title(&book, " ", false));
+        let shorter = SearchBook {
+            name: "Book ABC".into(),
+            ..Default::default()
+        };
+        assert!(matches_source_title(
+            &shorter,
+            "ＢＯＯＫ abc（完整版）",
+            false
+        ));
+        assert!(matches_source_title(&shorter, " ＢＯＯＫ abc ", true));
     }
 
     #[test]

@@ -4,6 +4,7 @@ import { useSearchParams } from "react-router-dom";
 
 import { BookDetailDialog } from "@/components/book/BookDetailDialog";
 import { SearchBar } from "@/components/search/SearchBar";
+import { SearchMatchMode } from "@/components/search/SearchMatchMode";
 import { SearchResultCard } from "@/components/search/SearchResultCard";
 import { Button, EmptyState, PageIntro, Skeleton, Spinner, cn } from "@/components/ui";
 import { useBookshelf } from "@/hooks/useBookshelf";
@@ -11,6 +12,7 @@ import { useSearchHistory } from "@/hooks/useSearchHistory";
 import { useSearchSSE } from "@/hooks/useSearchSSE";
 import { humanizeError } from "@/lib/errors";
 import { getJSON, setJSON } from "@/lib/storage";
+import { searchTarget } from "@/lib/search-match";
 import type { Book, SearchBook } from "@/types/api";
 
 /** 书架判重键: 后端 saveBook 以 bookUrl 或「书名 + 作者」认书, 这里用同一口径 */
@@ -61,17 +63,20 @@ const SKELETON_COUNT = 8;
 export default function SearchPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const q = searchParams.get("q")?.trim() ?? "";
-  const [keyword, setKeyword] = useState(q);
-  const { results, searching, progress, error, hasMore, start, stop, loadMore, hydrate, lastIndex } =
+  const target = searchTarget(q, searchParams.get("exact") === "1");
+  const exact = target.exact;
+  const searchKey = target.key;
+  const [draft, setDraft] = useState({ query: q, value: q });
+  const keyword = draft.query === q ? draft.value : q;
+  const setKeyword = (value: string) => setDraft({ query: q, value });
+  const { results, searching, progress, error, hasMore, start, stop, loadMore, hydrate, lastIndex, activeKey, activeExact } =
     useSearchSSE();
   /** 会话快照键: 预览/切页返回后恢复原搜索列表 */
-  const SEARCH_SNAPSHOT_KEY = "reader.search.snapshot.v1";
+  const SEARCH_SNAPSHOT_KEY = "reader.search.snapshot.v2";
   const { history, add: addHistory, clear: clearHistory } = useSearchHistory();
   const { books } = useBookshelf();
   /** 手动停止过: 状态行显示「已停止」, 下一次搜索开始时复位 */
   const [stopped, setStopped] = useState(false);
-  /** 已为哪个关键词发起过搜索 */
-  const [startedKey, setStartedKey] = useState<string | null>(null);
   /** 本次会话刚加入书架的书: 后端读缓存约 5 秒, ["books"] 重拉可能还没反映 */
   const [pendingShelf, setPendingShelf] = useState<readonly Book[]>([]);
   /** 详情弹窗当前书籍: 点击结果卡打开(砚台 book-detail 结构, 含章节目录) */
@@ -89,35 +94,39 @@ export default function SearchPage() {
   // q 变化(书架/导航跳转、刷新恢复)自动触发搜索; 有会话快照则先恢复列表不重搜.
   // StrictMode 首挂载会双跑: start 内部先断开旧连接幂等, hydrate 幂等可重复.
   useEffect(() => {
-    if (q.length === 0) {
+    if (searchKey.length === 0) {
+      stop();
       return;
     }
-    setKeyword(q);
     try {
       const snap = JSON.parse(sessionStorage.getItem(SEARCH_SNAPSHOT_KEY) ?? "null");
       if (
         snap !== null &&
-        snap.key === q &&
+        snap.key === searchKey &&
+        snap.exact === exact &&
         Array.isArray(snap.items) &&
         snap.items.length > 0
       ) {
-        hydrate(q, snap.items, snap.lastIndex ?? -1);
+        hydrate(searchKey, snap.items, snap.lastIndex ?? -1, exact);
         return;
       }
     } catch {
       /* 快照损坏则正常搜索 */
     }
-    addHistory(q);
-    start(q);
-  }, [q, start, hydrate, addHistory]);
+    addHistory(searchKey);
+    start(searchKey, { exact });
+  }, [searchKey, exact, start, stop, hydrate, addHistory]);
 
   // 卸载前保存会话快照: 去阅读器预览/切页返回后列表还在 (不重新起搜)
-  const snapRef = useRef<{ key: string; items: SearchBook[]; lastIndex: number }>({
+  const snapRef = useRef<{ key: string; exact: boolean; items: SearchBook[]; lastIndex: number }>({
     key: "",
+    exact: false,
     items: [],
     lastIndex: -1,
   });
-  snapRef.current = { key: keyword, items: results, lastIndex };
+  useEffect(() => {
+    snapRef.current = { key: activeKey ?? "", exact: activeExact, items: results, lastIndex };
+  }, [activeKey, activeExact, results, lastIndex]);
   useEffect(
     () => () => {
       const snap = snapRef.current;
@@ -128,18 +137,6 @@ export default function SearchPage() {
     [],
   );
 
-  // 已为当前 q 发起过搜索: q 变更时清零, 搜索一开始就记上(见下方 pendingStart)
-  useEffect(() => {
-    setStartedKey(null);
-  }, [q]);
-  useEffect(() => {
-    if (!searching) {
-      return;
-    }
-    setStartedKey(q);
-    setStopped(false);
-  }, [searching, q]);
-
   // 原始错误串进 console 供调试, UI 只展示 humanizeError 后的人话
   useEffect(() => {
     if (error !== null) {
@@ -148,18 +145,29 @@ export default function SearchPage() {
   }, [error]);
 
   const handleSearch = (raw: string) => {
-    const key = raw.trim();
+    const next = searchTarget(raw, exact);
+    const key = next.key;
     if (key.length === 0) {
       return;
     }
     setKeyword(key);
-    if (key === q) {
+    setStopped(false);
+    sessionStorage.removeItem(SEARCH_SNAPSHOT_KEY);
+    if (key === searchKey && next.exact === exact) {
       // 同关键词 URL 不变, effect 不会重跑, 直接重搜(start 会断开进行中的连接)
       addHistory(key);
-      start(key);
+      start(key, { exact: next.exact });
     } else {
-      setSearchParams({ q: key });
+      setSearchParams({ q: key, exact: next.exact ? "1" : "0" });
     }
+  };
+
+  const changeMatchMode = (nextExact: boolean) => {
+    if (nextExact === exact) return;
+    stop();
+    setStopped(false);
+    sessionStorage.removeItem(SEARCH_SNAPSHOT_KEY);
+    setSearchParams({ ...(searchKey ? { q: searchKey } : {}), exact: nextExact ? "1" : "0" });
   };
 
   const handleStop = () => {
@@ -172,13 +180,13 @@ export default function SearchPage() {
     setDetailOpen(true);
   };
 
-  const visibleResults = results;
+  const visibleResults = activeKey === searchKey && activeExact === exact ? results : [];
 
-  const initial = q.length === 0 && !searching && results.length === 0 && error === null;
+  const initial = searchKey.length === 0 && !searching && visibleResults.length === 0;
   const showResults = visibleResults.length > 0;
   // q 就绪但搜索还没发起(发起在绘制后的 effect 里): 这一帧继续按加载中渲染,
   // 否则会闪一下「没有找到相关书籍」, 骨架也断一拍; 快照恢复的结果不算 pending.
-  const pendingStart = q.length > 0 && !searching && startedKey !== q && results.length === 0;
+  const pendingStart = searchKey.length > 0 && (activeKey !== searchKey || activeExact !== exact);
   // 完成/停止后既无结果也无错误 → 搜索无结果
   const noResult = !initial && !pendingStart && !searching && !showResults && error === null;
   const errorText = error === null ? null : humanizeError(error);
@@ -236,6 +244,12 @@ export default function SearchPage() {
             onSelectHistory={handleSearch}
             onClearHistory={clearHistory}
           />
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            <SearchMatchMode exact={exact} onChange={changeMatchMode} />
+            <p className="text-xs text-muted-foreground">
+              {exact ? "书名或作者完整匹配，不匹配简介" : "书名、作者或简介包含关键词；空格分词全部匹配"}
+            </p>
+          </div>
         </div>
 
         {initial ? (
@@ -251,7 +265,7 @@ export default function SearchPage() {
             title="搜索失败"
             description={errorText}
             action={
-              <Button onClick={() => start(keyword)} disabled={keyword.trim().length === 0}>
+              <Button onClick={() => start(searchKey, { exact })} disabled={searchKey.length === 0}>
                 重试
               </Button>
             }

@@ -2720,13 +2720,10 @@ async fn search_book(
         return Json(ret);
     }
     // 参数解析（POST body JSON 优先，GET query 兜底）
-    let mut key = params.get("key").cloned().unwrap_or_default();
-    // legacy "=" 前缀 = 精确搜索（accurate）
-    let mut key_exact_prefix = false;
-    if key.starts_with('=') {
-        key_exact_prefix = true;
-        key.remove(0);
-    }
+    let (key, exact) = match search_key_and_mode(&params, body_json.as_ref()) {
+        Ok(search) => search,
+        Err(error) => return Json(error),
+    };
     let mut page = params
         .get("page")
         .and_then(|v| v.parse().ok())
@@ -2734,9 +2731,6 @@ async fn search_book(
     let mut book_source_param = params.get("bookSource").cloned().unwrap_or_default();
     if let Some(body) = body {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
-            if let Some(v) = json.get("key").and_then(|v| v.as_str()) {
-                key = v.to_string();
-            }
             if let Some(v) = json.get("page").and_then(|v| v.as_i64()) {
                 page = v;
             }
@@ -2780,12 +2774,10 @@ async fn search_book(
     {
         Ok(books) => {
             // legacy "=" 前缀/exact=1：按书名/作者等值过滤（大小写/全半角忽略）
-            let exact = key_exact_prefix || params.get("exact").map(|v| v == "1").unwrap_or(false);
-            let books = if exact {
-                crate::service::search::filter_exact(books, &key)
-            } else {
-                books
-            };
+            let books: Vec<_> = books
+                .into_iter()
+                .filter(|book| crate::service::search::matches_search(book, &key, exact))
+                .collect();
             Json(ReturnData::ok(
                 serde_json::to_value(books).unwrap_or(serde_json::Value::Null),
             ))
@@ -2815,13 +2807,10 @@ async fn search_book_multi(
     if let Err(ret) = require_book_source_permission(&state, &namespace).await {
         return Json(ret);
     }
-    let mut key = params.get("key").cloned().unwrap_or_default();
-    // legacy "=" 前缀 = 精确搜索（accurate）
-    let mut key_exact_prefix = false;
-    if key.starts_with('=') {
-        key_exact_prefix = true;
-        key.remove(0);
-    }
+    let (key, exact) = match search_key_and_mode(&params, body_json.as_ref()) {
+        Ok(search) => search,
+        Err(error) => return Json(error),
+    };
     let mut page = params
         .get("page")
         .and_then(|v| v.parse().ok())
@@ -2829,16 +2818,12 @@ async fn search_book_multi(
     let mut group = params.get("bookSourceGroup").cloned().unwrap_or_default();
     // P1-4 单源指定：精确匹配 bookSourceUrl（非空时只搜该源）
     let mut single_source_url = params.get("bookSourceUrl").cloned().unwrap_or_default();
-    let mut exact = params.get("exact").map(|v| v == "1").unwrap_or(false);
     let mut max_sources = params
         .get("maxSources")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(usize::MAX);
     if let Some(body) = body {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
-            if let Some(v) = json.get("key").and_then(|v| v.as_str()) {
-                key = v.to_string();
-            }
             if let Some(v) = json.get("page").and_then(|v| v.as_i64()) {
                 page = v;
             }
@@ -2851,20 +2836,10 @@ async fn search_book_multi(
             if let Some(v) = json.get("bookSourceUrl").and_then(|v| v.as_str()) {
                 single_source_url = v.to_string();
             }
-            if let Some(v) = json.get("exact") {
-                exact = v.as_u64() == Some(1)
-                    || v.as_str()
-                        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-                        .unwrap_or(false);
-            }
             if let Some(v) = json.get("maxSources").and_then(|v| v.as_u64()) {
                 max_sources = v as usize;
             }
         }
-    }
-    // legacy "=" 前缀强制精确
-    if key_exact_prefix {
-        exact = true;
     }
     if key.is_empty() {
         return Json(ReturnData::err("请输入搜索关键字"));
@@ -2996,9 +2971,7 @@ async fn search_book_multi(
         }
     }
     // 精确模式（exact=1）：书源规则解析后按书名/作者等值过滤（大小写/全半角忽略）
-    if exact {
-        all = crate::service::search::filter_exact(all, &key);
-    }
+    all.retain(|book| crate::service::search::matches_search(book, &key, exact));
     // 按 书名+作者 去重（legacy searchBookMulti 语义：同书多书源只保留一条）
     all = dedup_search_books(all);
     Json(ReturnData::ok(
@@ -3049,17 +3022,10 @@ async fn search_book_source(
     let url = param_of(&params, body_json.as_ref(), "url");
     let book_source_param = param_of(&params, body_json.as_ref(), "bookSource");
     // 精确模式（exact=1）：书名等值匹配（大小写/全半角忽略）；缺省模糊（双向包含）
-    let exact = params.get("exact").map(|v| v == "1").unwrap_or(false)
-        || body_json
-            .as_ref()
-            .and_then(|j| j.get("exact"))
-            .map(|v| {
-                v.as_u64() == Some(1)
-                    || v.as_str()
-                        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-                        .unwrap_or(false)
-            })
-            .unwrap_or(false);
+    let exact = match search_exact_param(&params, body_json.as_ref(), false) {
+        Ok(exact) => exact,
+        Err(error) => return Json(error),
+    };
     if url.is_empty() {
         return Json(ReturnData::err("请输入书籍链接"));
     }
@@ -3184,19 +3150,20 @@ async fn search_book_source(
             all.extend(books);
         }
     }
-    let ql = key.to_lowercase();
     let mut seen = std::collections::HashSet::new();
     let matched: Vec<_> = all
         .into_iter()
-        .filter(|b| {
-            if exact {
-                crate::service::search::exact_match(b, key)
-            } else {
-                let bl = b.name.to_lowercase();
-                bl.contains(&ql) || ql.contains(&bl)
-            }
+        .filter(|book| crate::service::search::matches_source_title(book, key, exact))
+        .filter(|book| {
+            seen.insert((
+                book.origin.clone(),
+                if exact {
+                    String::new()
+                } else {
+                    book.book_url.clone()
+                },
+            ))
         })
-        .filter(|b| seen.insert(b.origin.clone()))
         .collect();
     tracing::info!(
         "searchBookSource [{namespace}] 《{key}》：命中 {} 条",
@@ -3280,6 +3247,36 @@ pub(crate) fn param_of(
         }
     }
     params.get(key).cloned().unwrap_or_default()
+}
+
+fn search_exact_param(
+    params: &HashMap<String, String>,
+    body: Option<&Value>,
+    default: bool,
+) -> Result<bool, ReturnData> {
+    match param_of(params, body, "exact")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" => Ok(default),
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(ReturnData::err("匹配模式 exact 必须为 0、1、false 或 true")),
+    }
+}
+
+fn search_key_and_mode(
+    params: &HashMap<String, String>,
+    body: Option<&Value>,
+) -> Result<(String, bool), ReturnData> {
+    let exact = search_exact_param(params, body, false)?;
+    let key = param_of(params, body, "key");
+    let key = key.trim();
+    Ok(match key.strip_prefix('=') {
+        Some(key) => (key.trim().to_string(), true),
+        None => (key.to_string(), exact),
+    })
 }
 
 /// 书源分组匹配：group 为空匹配全部；书源分组支持逗号/顿号/空白分隔
@@ -6019,7 +6016,14 @@ async fn get_available_book_source(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    if let Err(error) = require_book_source_permission(&state, &namespace).await {
+        return Json(error);
+    }
     let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let exact = match search_exact_param(&params, body_json.as_ref(), true) {
+        Ok(exact) => exact,
+        Err(error) => return Json(error),
+    };
     let url = param_of(&params, body_json.as_ref(), "url");
     if url.is_empty() {
         return Json(ReturnData::err("请输入书籍链接"));
@@ -6035,10 +6039,17 @@ async fn get_available_book_source(
             return Json(ReturnData::err("系统错误"));
         }
     };
-    if book.name.is_empty() {
+    if book.name.trim().is_empty() {
         return Json(ReturnData::err("书籍信息错误"));
     }
-    let key = format!("{}_{}", book.name.trim(), book.author.trim());
+    let key = if exact {
+        format!("{}_{}", book.name.trim(), book.author.trim())
+    } else {
+        format!(
+            "match:fuzzy:{}",
+            json!([book.name.trim(), book.author.trim()])
+        )
+    };
 
     // 持久化候选：非刷新模式**只读缓存**
     // （旧实现「无缓存即全量并发搜索」= 首次换源必挂数分钟：177 源 × 慢源；
@@ -6048,6 +6059,12 @@ async fn get_available_book_source(
         .get_book_candidates(&namespace, &key)
         .await
         .unwrap_or_default();
+    let cached: Vec<_> = cached
+        .into_iter()
+        .filter(|candidate| {
+            crate::service::search::matches_source_title(candidate, &book.name, exact)
+        })
+        .collect();
     if refresh <= 0 {
         return Json(ReturnData::ok(
             serde_json::to_value(cached).unwrap_or(serde_json::Value::Null),
@@ -6065,7 +6082,7 @@ async fn get_available_book_source(
                 .collect(),
             Err(_) => return Json(ReturnData::err("系统错误")),
         };
-    if !origins.is_empty() {
+    if exact && !origins.is_empty() {
         sources.retain(|s| origins.contains(&s.book_source_url));
     }
     if sources.is_empty() {
@@ -6088,8 +6105,17 @@ async fn get_available_book_source(
             crate::service::search::search_one_source(&storage, &ns, &source, &key, 1, 15)
                 .await
                 .unwrap_or_default()
+                .into_iter()
+                .filter(|candidate| {
+                    crate::service::search::matches_source_title(candidate, &key, exact)
+                })
+                .collect::<Vec<_>>()
         }));
     }
+    let abort_handles: Vec<_> = handles
+        .iter()
+        .map(tokio::task::JoinHandle::abort_handle)
+        .collect();
     // 全量搜索预算：单源 15s 超时挡不住"若干慢源叠加"，超预算即用已收集结果收口
     // （模式与 search_book_multi 一致：select_all 逐个收，deadline 到点即停）
     const EARLY_HITS: usize = 60;
@@ -6124,11 +6150,23 @@ async fn get_available_book_source(
             }
         }
     }
+    for handle in abort_handles {
+        handle.abort();
+    }
     let mut seen = std::collections::HashSet::new();
     let matched: Vec<crate::service::search::SearchBook> = all
         .into_iter()
-        .filter(|b| crate::service::search::exact_match(b, &name))
-        .filter(|b| seen.insert(b.origin.clone()))
+        .filter(|candidate| crate::service::search::matches_source_title(candidate, &name, exact))
+        .filter(|candidate| {
+            seen.insert((
+                candidate.origin.clone(),
+                if exact {
+                    String::new()
+                } else {
+                    candidate.book_url.clone()
+                },
+            ))
+        })
         .collect();
 
     let _ = state
@@ -6456,6 +6494,10 @@ async fn search_book_source_sse(
         return sse_error(ret);
     }
     let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let exact = match search_exact_param(&params, body_json.as_ref(), false) {
+        Ok(exact) => exact,
+        Err(error) => return sse_error(error),
+    };
     let url = param_of(&params, body_json.as_ref(), "url");
     let book_source_param = param_of(&params, body_json.as_ref(), "bookSource");
     if url.is_empty() {
@@ -6560,16 +6602,21 @@ async fn search_book_source_sse(
         // 汇总：书名匹配过滤 + 按书源去重，逐源推送
         let mut last = -1i64;
         let mut seen = std::collections::HashSet::new();
-        let ql = key.to_lowercase();
         while let Some((i, books)) = tasks.next().await {
             last = i;
             let matched: Vec<_> = books
                 .into_iter()
-                .filter(|b| {
-                    let bl = b.name.to_lowercase();
-                    bl.contains(&ql) || ql.contains(&bl)
+                .filter(|book| crate::service::search::matches_source_title(book, &key, exact))
+                .filter(|book| {
+                    seen.insert((
+                        book.origin.clone(),
+                        if exact {
+                            String::new()
+                        } else {
+                            book.book_url.clone()
+                        },
+                    ))
                 })
-                .filter(|b| seen.insert(b.origin.clone()))
                 .collect();
             let payload = json!({ "lastIndex": i, "data": matched });
             if tx
@@ -8923,17 +8970,9 @@ async fn search_book_multi_sse(
     body: Option<axum::body::Bytes>,
 ) -> Response {
     // 参数解析（POST body JSON 优先，GET query 兜底）
-    let mut key = params.get("key").cloned().unwrap_or_default();
-    // legacy "=" 前缀 = 精确搜索（accurate）
-    let mut key_exact_prefix = false;
-    if key.starts_with('=') {
-        key_exact_prefix = true;
-        key.remove(0);
-    }
     let mut group = params.get("bookSourceGroup").cloned().unwrap_or_default();
     // P1-4 单源指定：精确匹配 bookSourceUrl（非空时只搜该源）
     let mut single_source_url = params.get("bookSourceUrl").cloned().unwrap_or_default();
-    let mut exact = params.get("exact").map(|v| v == "1").unwrap_or(false);
     let mut last_index = params
         .get("lastIndex")
         .and_then(|v| v.parse::<i64>().ok())
@@ -8948,22 +8987,17 @@ async fn search_book_multi_sse(
     let body_json = body
         .as_ref()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
+    let (key, exact) = match search_key_and_mode(&params, body_json.as_ref()) {
+        Ok(search) => search,
+        Err(error) => return sse_error(error),
+    };
     if let Some(body) = body {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
-            if let Some(v) = json.get("key").and_then(|v| v.as_str()) {
-                key = v.to_string();
-            }
             if let Some(v) = json.get("bookSourceGroup").and_then(|v| v.as_str()) {
                 group = v.to_string();
             }
             if let Some(v) = json.get("bookSourceUrl").and_then(|v| v.as_str()) {
                 single_source_url = v.to_string();
-            }
-            if let Some(v) = json.get("exact") {
-                exact = v.as_u64() == Some(1)
-                    || v.as_str()
-                        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-                        .unwrap_or(false);
             }
             if let Some(v) = json.get("lastIndex").and_then(|v| v.as_i64()) {
                 last_index = v;
@@ -8975,10 +9009,6 @@ async fn search_book_multi_sse(
                 concurrent_count = Some(v as usize);
             }
         }
-    }
-    // legacy "=" 前缀强制精确
-    if key_exact_prefix {
-        exact = true;
     }
 
     let namespace = match resolve_namespace(&state, &params, &headers).await {
@@ -9107,11 +9137,10 @@ async fn search_book_multi_sse(
                 });
                 let books = res.unwrap_or_default();
                 // 精确模式（exact=1）：书源规则解析后按书名/作者等值过滤（大小写/全半角忽略）
-                let books = if exact {
-                    crate::service::search::filter_exact(books, &key)
-                } else {
-                    books
-                };
+                let books: Vec<_> = books
+                    .into_iter()
+                    .filter(|book| crate::service::search::matches_search(book, &key, exact))
+                    .collect();
                 // 跨书源去重：同 书名+作者 只保留首个命中的书源
                 let mut unique = Vec::with_capacity(books.len());
                 let mut local_seen = std::collections::HashSet::new();
@@ -12221,6 +12250,321 @@ mod tests {
     use super::*;
     use axum::body::Bytes;
     use axum::extract::State as AxumState;
+
+    #[test]
+    fn test_search_match_mode_parameters() {
+        let query = HashMap::from([
+            ("key".into(), "=查询书".into()),
+            ("exact".into(), "1".into()),
+        ]);
+        assert_eq!(
+            search_key_and_mode(&query, None).unwrap(),
+            ("查询书".into(), true)
+        );
+        assert_eq!(
+            search_key_and_mode(&query, Some(&json!({"key": "正文书", "exact": false}))).unwrap(),
+            ("正文书".into(), false)
+        );
+        assert_eq!(
+            search_key_and_mode(&query, Some(&json!({"key": " =正文书 ", "exact": 0}))).unwrap(),
+            ("正文书".into(), true)
+        );
+        for (value, expected) in [
+            (json!(0), false),
+            (json!(1), true),
+            (json!(false), false),
+            (json!(true), true),
+            (json!("TRUE"), true),
+            (json!("false"), false),
+        ] {
+            assert_eq!(
+                search_exact_param(&query, Some(&json!({"exact": value})), false).unwrap(),
+                expected
+            );
+        }
+        for value in [json!(2), json!(-1), json!("unknown"), json!([])] {
+            assert!(
+                search_exact_param(&HashMap::new(), Some(&json!({"exact": value})), true).is_err()
+            );
+        }
+        assert!(search_exact_param(&HashMap::new(), None, true).unwrap());
+        assert!(!search_exact_param(&HashMap::new(), None, false).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_search_match_modes_http_and_sse() {
+        use tower::ServiceExt as _;
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
+        struct SourceGuard(bool);
+        impl Drop for SourceGuard {
+            fn drop(&mut self) {
+                crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                    .store(self.0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _source = SourceGuard(
+            crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                .swap(true, std::sync::atomic::Ordering::Relaxed),
+        );
+        let (state, dir) = test_state("searchmodes").await;
+        let payload = json!({"data": [
+            {"name": "Book ABC", "author": "作者甲", "url": "/book/1", "intro": "fantasy"},
+            {"name": "Book ABC（完整版）", "author": "作者乙", "url": "/book/2", "intro": "fantasy"},
+            {"name": "其他书", "author": "Book ABC", "url": "/book/3", "intro": "other"},
+            {"name": "无关书", "author": "作者丙", "url": "/book/4", "intro": "other"}
+        ]});
+        let source_url = serve_bodies(vec![payload.to_string()]).await;
+        let base = source_url.trim_end_matches("/sources.json").to_string();
+        state.storage.save_book_source("default", &crate::model::BookSource {
+            book_source_url: base.clone(), enabled: true,
+            search_url: Some(format!("{base}/search?q={{key}}")),
+            rule_search: Some(json!({"bookList": "$.data[*]", "name": "$.name", "author": "$.author", "bookUrl": "$.url", "intro": "$.intro"})),
+            ..Default::default()
+        }).await.unwrap();
+        let app = router(state.storage.config.clone(), state.storage.clone());
+        for (endpoint, method, key, exact, expected) in [
+            ("searchBook", "POST", "ＢＯＯＫ abc", json!(true), 2),
+            ("searchBookMulti", "GET", "Book ABC", json!(0), 3),
+            ("searchBookMultiSSE", "GET", "=Book ABC", json!(0), 2),
+            ("searchBookMultiSSE", "POST", "Book ABC", json!("false"), 3),
+            ("searchBook", "POST", "Book fantasy", json!(false), 2),
+            ("searchBookMulti", "POST", "=Book ABC", json!(false), 2),
+        ] {
+            let body = json!({"key": key, "exact": exact, "bookSource": base, "searchSize": 10, "concurrentCount": 1});
+            let mut request = axum::http::Request::builder().method(method);
+            let request = if method == "GET" {
+                let mut url =
+                    reqwest::Url::parse(&format!("http://reader.example/reader3/{endpoint}"))
+                        .unwrap();
+                url.query_pairs_mut()
+                    .append_pair("key", key)
+                    .append_pair("exact", &exact.to_string());
+                request
+                    .uri(format!("/reader3/{endpoint}?{}", url.query().unwrap()))
+                    .body(Body::empty())
+                    .unwrap()
+            } else {
+                request = request.uri(format!("/reader3/{endpoint}?exact=1&key=wrong"));
+                request
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap()
+            };
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+                .await
+                .unwrap();
+            let books: Vec<Value> = if endpoint.ends_with("SSE") {
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                text.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .flat_map(|payload| payload["data"].as_array().cloned().unwrap_or_default())
+                    .collect()
+            } else {
+                let payload: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(payload["isSuccess"], true, "{payload}");
+                payload["data"].as_array().unwrap().clone()
+            };
+            assert_eq!(books.len(), expected, "{endpoint} {method} {books:?}");
+            assert!(books.iter().all(|book| book["name"] != "无关书"));
+        }
+        cleanup(state, dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_search_match_modes_candidates_and_source_sse() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
+        struct SourceGuard(bool);
+        impl Drop for SourceGuard {
+            fn drop(&mut self) {
+                crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                    .store(self.0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _source = SourceGuard(
+            crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                .swap(true, std::sync::atomic::Ordering::Relaxed),
+        );
+        let (mut state, dir) = test_state("candidate-search-modes").await;
+        let book_url = "https://book.example/current";
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: book_url.into(),
+                    name: "Book ABC".into(),
+                    author: "作者甲".into(),
+                    dur_chapter_index: 7,
+                    dur_chapter_pos: 123,
+                    is_in_shelf: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        for (source_name, books) in [
+            (
+                "exact",
+                json!([{"name":"Book ABC", "author":"作者乙", "url":"/book/1"}]),
+            ),
+            (
+                "fuzzy",
+                json!([
+                    {"name":"Book ABC（完整版）", "author":"作者丙", "url":"/book/2"},
+                    {"name":"Book ABC番外", "author":"作者丁", "url":"/book/3"},
+                    {"name":"其他书", "author":"Book ABC", "url":"/book/4"}
+                ]),
+            ),
+        ] {
+            let url = serve_bodies(vec![json!({"data":books}).to_string()]).await;
+            let base = url.trim_end_matches("/sources.json").to_string();
+            state.storage.save_book_source("default", &crate::model::BookSource {
+                book_source_url: base.clone(), book_source_name: source_name.into(), enabled: true,
+                search_url: Some(format!("{base}/search?q={{key}}")),
+                rule_search: Some(json!({"bookList":"$.data[*]", "name":"$.name", "author":"$.author", "bookUrl":"$.url"})),
+                ..Default::default()
+            }).await.unwrap();
+        }
+        let parameters = |refresh: i64, exact: i64| {
+            HashMap::from([
+                ("url".into(), book_url.into()),
+                ("refresh".into(), refresh.to_string()),
+                ("exact".into(), exact.to_string()),
+            ])
+        };
+        let exact = get_available_book_source(
+            AxumState(state.clone()),
+            Query(parameters(1, 1)),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert!(exact.0.is_success, "{}", exact.0.error_msg);
+        assert_eq!(exact.0.data.as_array().unwrap().len(), 1);
+        let fuzzy_cached = get_available_book_source(
+            AxumState(state.clone()),
+            Query(parameters(0, 0)),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert_eq!(fuzzy_cached.0.data, json!([]));
+        let fuzzy = get_available_book_source(
+            AxumState(state.clone()),
+            Query(parameters(1, 0)),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert!(fuzzy.0.is_success, "{}", fuzzy.0.error_msg);
+        assert_eq!(fuzzy.0.data.as_array().unwrap().len(), 3);
+        let exact_cached = get_available_book_source(
+            AxumState(state.clone()),
+            Query(parameters(0, 1)),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert_eq!(exact_cached.0.data, exact.0.data);
+        let fuzzy_cached = get_available_book_source(
+            AxumState(state.clone()),
+            Query(parameters(0, 0)),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert_eq!(fuzzy_cached.0.data, fuzzy.0.data);
+        let query = HashMap::from([
+            ("url".into(), book_url.into()),
+            ("bookSource".into(), "https://current.example".into()),
+            ("exact".into(), "1".into()),
+        ]);
+        let regular = search_book_source(
+            AxumState(state.clone()),
+            Query(query.clone()),
+            HeaderMap::new(),
+            Some(Bytes::from(json!({"exact": false}).to_string())),
+        )
+        .await;
+        assert!(regular.0.is_success);
+        assert_eq!(regular.0.data.as_array().unwrap().len(), 3);
+        let response = search_book_source_sse(
+            AxumState(state.clone()),
+            Query(query),
+            HeaderMap::new(),
+            Some(Bytes::from(json!({"exact": true}).to_string())),
+        )
+        .await;
+        let text = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 1_000_000)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let books: Vec<Value> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .flat_map(|payload| payload["data"].as_array().cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(books.len(), 1, "{text}");
+        assert_eq!(books[0]["name"], "Book ABC");
+        let saved = state
+            .storage
+            .find_book("default", book_url)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((saved.dur_chapter_index, saved.dur_chapter_pos), (7, 123));
+        state.storage.config.secure = true;
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "search-mode-test".into(),
+                enable_book_source: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut private = parameters(0, 0);
+        private.insert("accessToken".into(), "alice:search-mode-test".into());
+        state
+            .storage
+            .upsert_book(
+                "alice",
+                &crate::model::Book {
+                    book_url: book_url.into(),
+                    name: "Book ABC".into(),
+                    author: "作者甲".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let isolated = get_available_book_source(
+            AxumState(state.clone()),
+            Query(private),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert!(isolated.0.is_success);
+        assert_eq!(isolated.0.data, json!([]));
+        let denied = get_available_book_source(
+            AxumState(state.clone()),
+            Query(parameters(1, 0)),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert_eq!(denied.0.data, json!("NEED_LOGIN"));
+        cleanup(state, dir).await;
+    }
 
     /// 独立临时目录存储（避免污染真实 storage/reader.db）
     async fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {

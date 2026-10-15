@@ -10,6 +10,7 @@ import {
 import * as React from "react";
 import { useNavigate } from "react-router-dom";
 
+import { SearchMatchMode } from "@/components/search/SearchMatchMode";
 import {
   Badge,
   Button,
@@ -33,6 +34,7 @@ import {
   useBookshelf,
 } from "@/hooks/useBookshelf";
 import { humanizeError } from "@/lib/errors";
+import { matchesSourceTitle } from "@/lib/search-match";
 import { getBookInfo, getChapterList, getCoverUrl } from "@/services/book";
 import {
   getAvailableBookSource,
@@ -84,6 +86,7 @@ function BookDetail({ book, onAdded }: { book: SearchBook; onAdded?: (saved: Boo
   const [switchOpen, setSwitchOpen] = React.useState(false);
   /** true = 让后端用全部书源重新搜索候选(慢), 作为独立 query key 与缓存结果区分 */
   const [deepSearch, setDeepSearch] = React.useState(false);
+  const [switchExact, setSwitchExact] = React.useState(true);
   /** 本次会话里刚加入书架: 后端用户存储读取有数秒缓存, 书架列表不会立刻反映 */
   const [added, setAdded] = React.useState(false);
 
@@ -124,8 +127,9 @@ function BookDetail({ book, onAdded }: { book: SearchBook; onAdded?: (saved: Boo
   const exactInShelf = added || books.some((item) => item.bookUrl === currentBookUrl);
 
   const available = useQuery({
-    queryKey: ["availableBookSources", currentBookUrl, deepSearch ? 1 : 0],
-    queryFn: () => getAvailableBookSource(currentBookUrl, deepSearch),
+    queryKey: ["availableBookSources", currentBookUrl, deepSearch ? 1 : 0, switchExact],
+    queryFn: ({ signal }) => getAvailableBookSource(currentBookUrl, deepSearch, { signal }, switchExact),
+    retry: false,
     enabled: switchOpen && exactInShelf,
   });
 
@@ -172,7 +176,7 @@ function BookDetail({ book, onAdded }: { book: SearchBook; onAdded?: (saved: Boo
     (saved: Book) => {
       setAdded(true);
       onAdded?.(saved);
-      queryClient.setQueryData(["availableBookSources", saved.bookUrl, 0], [
+      queryClient.setQueryData(["availableBookSources", saved.bookUrl, 0, true], [
         toAvailableBookSource(saved),
       ]);
     },
@@ -245,8 +249,8 @@ function BookDetail({ book, onAdded }: { book: SearchBook; onAdded?: (saved: Boo
         known.add(key);
       }
     }
-    return list;
-  }, [available.data, originCandidatesData]);
+    return list.filter((candidate) => matchesSourceTitle(candidate.name, name, switchExact));
+  }, [available.data, originCandidatesData, name, switchExact]);
   /** 搜索命中过但现在取不到书的源: 灰行列出并说明, 不静默消失 */
   const deadOrigins = React.useMemo(
     () => (originCandidatesData ?? []).filter((entry) => entry.candidate === null).map((entry) => entry.origin),
@@ -388,11 +392,17 @@ function BookDetail({ book, onAdded }: { book: SearchBook; onAdded?: (saved: Boo
                   className="ml-auto"
                   loading={available.isFetching}
                   disabled={!inShelf || changeSource.isPending}
-                  onClick={() => setDeepSearch(true)}
+                  onClick={() => { if (deepSearch) void available.refetch(); else setDeepSearch(true); }}
                 >
                   {available.isFetching ? null : <RefreshCw aria-hidden />}
                   重新搜索
                 </Button>
+              </div>
+              <div className="mt-3 space-y-2">
+                <SearchMatchMode exact={switchExact} disabled={busy} onChange={(exact) => { setDeepSearch(false); setSwitchExact(exact); }} />
+                <p className="text-xs text-muted-foreground">
+                  {switchExact ? "完整匹配书名；请核对候选作者" : "模糊匹配书名，可能包含不同作品；请核对书名和作者"}
+                </p>
               </div>
 
               {!exactInShelf ? (
@@ -412,7 +422,7 @@ function BookDetail({ book, onAdded }: { book: SearchBook; onAdded?: (saved: Boo
               ) : candidates.length === 0 && deadOrigins.length === 0 ? (
                 <p className="mt-2 text-xs text-muted-foreground">
                   {exactInShelf
-                    ? "暂无可用书源, 点「重新搜索」用全部书源找一遍"
+                    ? "当前模式暂无候选，请点击重新搜索"
                     : "搜索结果只命中当前源, 暂无其他书源"}
                 </p>
               ) : (
@@ -437,7 +447,10 @@ function BookDetail({ book, onAdded }: { book: SearchBook; onAdded?: (saved: Boo
                           }}
                           className="flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-none transition duration-150 ease-out hover:bg-surface-muted focus-visible:ring-2 focus-visible:ring-accent/60 disabled:pointer-events-none disabled:opacity-60"
                         >
-                          <span className="min-w-0 flex-1 truncate">{item.originName}</span>
+                          <span className="min-w-0 flex-1 truncate">
+                            <span className="block truncate">{item.name} · {item.author || "佚名"}</span>
+                            <span className="block truncate text-xs text-muted-foreground">{item.originName}</span>
+                          </span>
                           {item.origin === LOCAL_ORIGIN ? (
                             <Badge variant="muted" size="sm">
                               本地
