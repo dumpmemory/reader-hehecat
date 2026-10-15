@@ -20,7 +20,23 @@ import { TocDrawer } from "@/components/reader/TocDrawer";
 import { TtsBar } from "@/components/reader/TtsBar";
 import { useShelfToggle } from "@/components/reader/useShelfToggle";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Button, EmptyState, cn, toast } from "@/components/ui";
+import {
+  Button,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  EmptyState,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  cn,
+  toast,
+} from "@/components/ui";
 import { useBookData } from "@/hooks/useBookData";
 import { useChapterContent } from "@/hooks/useChapterContent";
 import { useReaderProgress } from "@/hooks/useReaderProgress";
@@ -191,17 +207,57 @@ export default function ReaderPage() {
   });
 
   const chapter = chapters[progress.index];
+  const chapterOrigin = bookSourceUrl ?? book?.origin;
+  const chapterBookType = shelfBook?.type ?? book?.type;
   const content = useChapterContent(
     bookUrl,
     progress.index,
     chapter,
-    bookSourceUrl ?? book?.origin,
+    chapterOrigin,
     chapters.length,
     chapters[progress.index + 1]?.url,
     chapters[progress.index + 2]?.url,
     chapters[progress.index + 1]?.title,
     chapters[progress.index + 2]?.title,
+    chapterBookType,
   );
+  const refreshScope = React.useMemo(() => ({
+    bookUrl,
+    index: progress.index,
+    chapterUrl: chapter?.url,
+    chapterTitle: chapter?.title,
+    isVolume: chapter?.isVolume,
+    chapterCount: chapters.length,
+    origin: chapterOrigin,
+    bookType: chapterBookType,
+  }), [bookUrl, progress.index, chapter?.url, chapter?.title, chapter?.isVolume, chapters.length, chapterOrigin, chapterBookType]);
+  const currentRefreshScope = React.useRef<typeof refreshScope | null>(refreshScope);
+  const [refreshDialogScope, setRefreshDialogScope] = React.useState<typeof refreshScope | null>(null);
+  const [refreshRetryCount, setRefreshRetryCount] = React.useState(2);
+  React.useLayoutEffect(() => {
+    currentRefreshScope.current = refreshScope;
+    return () => {
+      currentRefreshScope.current = null;
+    };
+  }, [refreshScope]);
+  const canRefreshContent = content.canRefresh && !bookQuery.isFetching && !chaptersQuery.isFetching;
+  const refreshContent = content.refresh;
+  const handleRefreshContent = React.useCallback(async () => {
+    if (!canRefreshContent || refreshDialogScope !== refreshScope) {
+      return;
+    }
+    setRefreshDialogScope(null);
+    try {
+      const refreshed = await refreshContent(refreshRetryCount);
+      if (refreshed && currentRefreshScope.current === refreshScope) {
+        toast.success("本章已刷新");
+      }
+    } catch (error) {
+      if (currentRefreshScope.current === refreshScope) {
+        toast.error(`${humanizeError(errorMessage(error, "本章刷新失败"))}；已保留原正文和阅读进度`);
+      }
+    }
+  }, [canRefreshContent, refreshContent, refreshDialogScope, refreshRetryCount, refreshScope]);
 
   const toc = useToc({ book, onNavigate: goToChapter });
 
@@ -577,6 +633,13 @@ export default function ReaderPage() {
           chapterTitle={chapter?.title ?? ""}
           percent={readPercent}
           onBack={handleBack}
+          canRefresh={canRefreshContent}
+          isRefreshing={content.isRefreshing}
+          onRefresh={() => {
+            if (canRefreshContent) {
+              setRefreshDialogScope(refreshScope);
+            }
+          }}
           bookmarked={currentBookmark !== undefined}
           onToggleBookmark={handleToggleBookmark}
           inShelf={shelf.inShelf}
@@ -684,6 +747,48 @@ export default function ReaderPage() {
         onSelect={handleSelectAnnotation}
         onDelete={handleDeleteAnnotation}
       />
+      <Dialog
+        open={refreshDialogScope === refreshScope}
+        onOpenChange={(open) => {
+          if (!open) {
+            setRefreshDialogScope(null);
+          }
+        }}
+      >
+        <DialogContent width="sm" className="h-auto max-h-[85dvh] rounded-t-xl">
+          <DialogHeader>
+            <DialogTitle>刷新本章</DialogTitle>
+            <DialogDescription>绕过章节缓存，从当前书源重新抓取本章正文。</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 px-4 pb-4 md:px-5">
+            <p className="truncate text-sm font-medium">{chapter?.title}</p>
+            <label htmlFor="reader-refresh-retry-count" className="block text-sm">失败重试次数</label>
+            <Select value={String(refreshRetryCount)} onValueChange={(value) => setRefreshRetryCount(Number(value))}>
+              <SelectTrigger id="reader-refresh-retry-count" aria-describedby="reader-refresh-retry-help">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {[0, 1, 2, 3, 4, 5].map((count) => (
+                  <SelectItem key={count} value={String(count)}>
+                    {count === 0 ? "0 次（不重试）" : `${count} 次`}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p id="reader-refresh-retry-help" className="text-xs leading-relaxed text-muted-foreground">
+              由服务器在失败后最多重试 {refreshRetryCount} 次，共最多 {refreshRetryCount + 1} 次抓取。
+              刷新失败会保留原正文和阅读进度。
+            </p>
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setRefreshDialogScope(null)}>取消</Button>
+            <Button disabled={!canRefreshContent} onClick={() => { void handleRefreshContent(); }}>
+              重新抓取本章
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <AddBookmarkDialog
         draft={draft}
         onOpenChange={(open) => {

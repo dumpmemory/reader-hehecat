@@ -373,7 +373,7 @@ fn proxy_http_client(proxy_url: &str) -> Result<reqwest::Client> {
 }
 
 /// 可重试的传输层错误（超时/连接中断/EOF/TLS 握手——不重试 4xx/5xx 业务响应）
-fn retryable_http_error(e: &anyhow::Error) -> bool {
+pub(crate) fn retryable_http_error(e: &anyhow::Error) -> bool {
     // 顶层消息可能是 "error decoding response body"，真正的 EOF/断连在 cause 链里——
     // 用 {:#} 输出完整错误链再匹配，避免漏判导致传输失败不重试。
     let lower = format!("{e:#}").to_ascii_lowercase();

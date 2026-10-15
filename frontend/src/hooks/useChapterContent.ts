@@ -1,9 +1,10 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import DOMPurify from "dompurify";
-import { useEffect, useMemo } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
+import { LOCAL_ORIGIN } from "@/hooks/useBookshelf";
 import { proxiedAssetUrl } from "@/lib/asset";
-import { getBookContent } from "@/services/book";
+import { getBookContent, refreshBookContent, type BookContent } from "@/services/book";
 import { activeReplaceRules, applyReplaceRules, useReplaceRules } from "@/services/purify";
 import type { BookChapter } from "@/types/api";
 
@@ -133,6 +134,14 @@ export interface UseChapterContentResult {
   /** 请求成功但正文 (净化后) 为空 */
   isEmpty: boolean;
   refetch: () => void;
+  refresh: (retryCount?: number) => Promise<boolean>;
+  isRefreshing: boolean;
+  canRefresh: boolean;
+}
+
+function isLocalContentUrl(url: string): boolean {
+  return /^(?:local:|local-file:|file:|storage\/)/i.test(url)
+    || /\.(?:epub|txt|mobi|azw3|pdf|fb2|docx|zip|cbz|umd)#[^#]*$/i.test(url);
 }
 
 /**
@@ -152,23 +161,97 @@ export function useChapterContent(
   nextChapterUrl2?: string,
   nextChapterTitle?: string,
   nextChapterTitle2?: string,
+  bookType?: number,
 ): UseChapterContentResult {
   const queryClient = useQueryClient();
+  const chapterUrl = chapter?.url;
+  const chapterTitle = chapter?.title;
+  const isVolume = chapter?.isVolume ?? false;
+  const refreshTarget = useMemo(() => ({
+    queryKey: ["content", bookUrl, index] as const,
+    bookUrl,
+    index,
+    url: chapterUrl ?? "",
+    options: { bookSourceUrl: origin, bookUrl, title: chapterTitle },
+    supported: bookUrl.trim() !== ""
+      && Number.isInteger(index) && index >= 0
+      && (chapterCount === undefined || index < chapterCount)
+      && chapterUrl !== undefined && chapterUrl.trim() !== "" && !isVolume
+      && bookType === 0 && origin !== LOCAL_ORIGIN
+      && !isLocalContentUrl(bookUrl) && !isLocalContentUrl(chapterUrl),
+  }), [bookUrl, index, chapterUrl, chapterTitle, isVolume, chapterCount, origin, bookType]);
+  const currentTarget = useRef<typeof refreshTarget | null>(refreshTarget);
+  const activeRefresh = useRef<{
+    target: typeof refreshTarget;
+    controller: AbortController;
+  } | null>(null);
+  const [refreshingTarget, setRefreshingTarget] = useState<typeof refreshTarget | null>(null);
+  const isRefreshing = refreshingTarget === refreshTarget;
+
+  useLayoutEffect(() => {
+    currentTarget.current = refreshTarget;
+    return () => {
+      currentTarget.current = null;
+      const request = activeRefresh.current;
+      if (request?.target === refreshTarget) {
+        activeRefresh.current = null;
+        request.controller.abort();
+      }
+    };
+  }, [refreshTarget]);
 
   // warp getBookContent 的 url 参数是章节页 URL (Kotlin 旧形为 bookUrl+index 内部解析);
   // 章节列表就绪后才发起, 避免 index=0 抢跑污染书架进度.
   const contentQuery = useQuery({
-    queryKey: ["content", bookUrl, index],
-    queryFn: () =>
-      getBookContent(chapter?.url ?? bookUrl, index, {
-        bookSourceUrl: origin,
-        bookUrl,
-        title: chapter?.title,
-      }),
+    queryKey: refreshTarget.queryKey,
+    queryFn: ({ signal }) =>
+      getBookContent(chapterUrl ?? bookUrl, index, refreshTarget.options, { signal }),
     enabled: bookUrl !== "" && index >= 0 && chapter !== undefined,
+    retry: false,
     // 服务端章节缓存命中即秒回; staleTime 让章间往返/回退重进走客户端缓存
     staleTime: 5 * 60_000,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: !isRefreshing,
   });
+
+  const canRefresh = refreshTarget.supported && !contentQuery.isPending && !isRefreshing;
+  const refresh = useCallback(async (retryCount?: number): Promise<boolean> => {
+    if (!canRefresh || activeRefresh.current !== null || currentTarget.current !== refreshTarget) {
+      return false;
+    }
+    const request = { target: refreshTarget, controller: new AbortController() };
+    activeRefresh.current = request;
+    setRefreshingTarget(refreshTarget);
+    const isCurrent = () => activeRefresh.current === request
+      && currentTarget.current === refreshTarget && !request.controller.signal.aborted;
+    try {
+      await queryClient.cancelQueries({ queryKey: refreshTarget.queryKey, exact: true });
+      if (!isCurrent()) {
+        return false;
+      }
+      const data = await refreshBookContent(
+        refreshTarget.url,
+        refreshTarget.index,
+        { ...refreshTarget.options, retryCount },
+        { signal: request.controller.signal },
+      );
+      if (!isCurrent()) {
+        return false;
+      }
+      queryClient.setQueryData<BookContent>(refreshTarget.queryKey, data);
+      return true;
+    } catch (error) {
+      if (!isCurrent()) {
+        return false;
+      }
+      throw error;
+    } finally {
+      if (activeRefresh.current === request) {
+        activeRefresh.current = null;
+        setRefreshingTarget(null);
+      }
+    }
+  }, [canRefresh, queryClient, refreshTarget]);
 
   const isSuccess = contentQuery.isSuccess;
   // 预加载后续两章: 缓存未覆盖到的阅读前沿时, 翻页前大概率已缓存秒开
@@ -189,20 +272,20 @@ export function useChapterContent(
       }
       void queryClient.prefetchQuery({
         queryKey: ["content", bookUrl, nextIndex],
-        queryFn: () =>
+        queryFn: ({ signal }) =>
           getBookContent(url, nextIndex, {
             cache: true,
             bookSourceUrl: origin,
             bookUrl,
             title: nextTitle,
-          }),
+          }, { signal }),
         staleTime: 5 * 60_000,
+        retry: false,
       });
     }
-  }, [queryClient, bookUrl, index, isSuccess, chapterCount, nextChapterUrl, nextChapterUrl2, origin]);
+  }, [queryClient, bookUrl, index, isSuccess, chapterCount, nextChapterUrl, nextChapterUrl2, nextChapterTitle, nextChapterTitle2, origin]);
 
-  const rawTitle = chapter?.title ?? "";
-  const isVolume = chapter?.isVolume ?? false;
+  const rawTitle = chapterTitle ?? "";
   const rawContent = contentQuery.data?.content ?? "";
 
   // 净化规则: warp 只做规则 CRUD, 不把规则应用到正文, 所以替换发生在渲染期 ——
@@ -232,8 +315,13 @@ export function useChapterContent(
     isError: contentQuery.isError,
     errorMessage: error instanceof Error && error.message !== "" ? error.message : "正文加载失败",
     isEmpty: isSuccess && content.trim() === "",
+    refresh,
+    isRefreshing,
+    canRefresh,
     refetch: () => {
-      void contentQuery.refetch();
+      if (activeRefresh.current === null) {
+        void contentQuery.refetch();
+      }
     },
   };
 }

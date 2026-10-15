@@ -16,6 +16,23 @@ pub struct Storage {
     pub config: AppConfig,
 }
 
+fn chapter_content_query<'query>(
+    ns: &'query str,
+    book_url: &'query str,
+    index: i64,
+    title: &'query str,
+    content: &'query str,
+) -> sqlx::query::Query<'query, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'query>> {
+    sqlx::query(
+        "INSERT OR REPLACE INTO book_chapters (book_url, chapter_index, title, content, user_namespace) VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(book_url)
+    .bind(index)
+    .bind(title)
+    .bind(content)
+    .bind(ns)
+}
+
 /// 缓存统计（getCacheInfo）
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2332,17 +2349,42 @@ impl Storage {
         title: &str,
         content: &str,
     ) -> Result<()> {
-        sqlx::query(
-            "INSERT OR REPLACE INTO book_chapters (book_url, chapter_index, title, content, user_namespace) VALUES (?1, ?2, ?3, ?4, ?5)",
-        )
-        .bind(book_url)
-        .bind(index)
-        .bind(title)
-        .bind(content)
-        .bind(ns)
-        .execute(&self.pool)
-        .await?;
+        chapter_content_query(ns, book_url, index, title, content)
+            .execute(&self.pool)
+            .await?;
         Ok(())
+    }
+
+    pub async fn refresh_chapter_content(
+        &self,
+        ns: &str,
+        book_url: &str,
+        index: i64,
+        title: &str,
+        content: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "刷新正文写回超时");
+        let mut transaction = tokio::time::timeout_at(deadline, self.pool.begin()).await??;
+        let result = tokio::time::timeout_at(
+            deadline,
+            chapter_content_query(ns, book_url, index, title, content).execute(&mut *transaction),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) if tokio::time::Instant::now() < deadline => {
+                transaction.commit().await?;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                transaction.rollback().await?;
+                Err(error.into())
+            }
+            _ => {
+                transaction.rollback().await?;
+                Err(anyhow::anyhow!("刷新正文写回超时，已回滚"))
+            }
+        }
     }
 
     /// 删除本地书（含章节）
@@ -9774,6 +9816,62 @@ mod tests {
         );
 
         cleanup(storage, "chapcache").await;
+    }
+
+    #[tokio::test]
+    async fn test_refresh_chapter_content_timeout_rolls_back() {
+        let storage = test_storage("chapterrefreshlock").await;
+        let book_url = "https://book.example/lock";
+        storage
+            .cache_chapter_content("default", book_url, 1, "标题", "旧正文")
+            .await
+            .unwrap();
+        let mut lock = storage.pool.begin().await.unwrap();
+        sqlx::query("UPDATE book_chapters SET title = 'locked' WHERE book_url = ?1")
+            .bind(book_url)
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(30);
+        let refresh = tokio::spawn({
+            let storage = storage.clone();
+            async move {
+                storage
+                    .refresh_chapter_content("default", book_url, 1, "新标题", "新正文", deadline)
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        lock.rollback().await.unwrap();
+        assert!(refresh.await.unwrap().is_err());
+        assert_eq!(
+            storage
+                .get_chapter_content("default", book_url, 1)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("旧正文")
+        );
+        storage
+            .refresh_chapter_content(
+                "default",
+                book_url,
+                1,
+                "新标题",
+                "新正文",
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_chapter_content("default", book_url, 1)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("新正文")
+        );
+        cleanup(storage, "chapterrefreshlock").await;
     }
 
     /// P0 跨用户缓存隔离：userA 写正文/目录缓存，userB 同 bookUrl 不得命中

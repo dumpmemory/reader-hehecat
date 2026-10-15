@@ -403,6 +403,20 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
             "/reader3/getBookContent",
             get(get_book_content).post(get_book_content),
         )
+        .route(
+            "/reader3/refreshBookContent",
+            get(refresh_book_content)
+                .post(refresh_book_content)
+                .layer(axum::middleware::map_response(
+                    |mut response: Response| async move {
+                        response.headers_mut().insert(
+                            axum::http::header::CACHE_CONTROL,
+                            axum::http::HeaderValue::from_static("no-store"),
+                        );
+                        response
+                    },
+                )),
+        )
         // 差距补全批：多格式导出 / 书源调试 / 整书缓存 / 用户配置 / 本地书刷新 / 批量接口 / 书源健康 / 阅读统计
         .route("/reader3/exportBook", get(export_book).post(export_book))
         // legacy 书籍级阅读配置持久化（YueduApi.kt:371）
@@ -4108,6 +4122,25 @@ async fn get_book_content(
     headers: HeaderMap,
     body: Option<axum::body::Bytes>,
 ) -> Json<ReturnData> {
+    get_book_content_impl(state, params, headers, body, false).await
+}
+
+async fn refresh_book_content(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    get_book_content_impl(state, params, headers, body, true).await
+}
+
+async fn get_book_content_impl(
+    state: AppState,
+    params: HashMap<String, String>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+    force_refresh: bool,
+) -> Json<ReturnData> {
     let namespace = match resolve_namespace(&state, &params, &headers).await {
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
@@ -4119,15 +4152,31 @@ async fn get_book_content(
     } else {
         chapter_url
     };
+    let refresh = force_refresh
+        || matches!(
+            param_of(&params, body_json.as_ref(), "refresh").as_str(),
+            "1" | "true"
+        );
+    let book_url = param_of(&params, body_json.as_ref(), "bookUrl");
+    let retry_param = param_of(&params, body_json.as_ref(), "retryCount");
+    let retry_count = if retry_param.is_empty() {
+        crate::service::book::chapter_retry_count()
+    } else {
+        match retry_param.parse::<usize>() {
+            Ok(count) if count <= crate::service::book::MAX_CHAPTER_RETRIES => count,
+            _ => return Json(ReturnData::err("重试次数必须是 0 到 5 的整数")),
+        }
+    };
     // legacy 参数：index（章节索引，正文读取成功时更新书架进度）、cache（1=仅缓存模式不保存进度）
     let index_hint = param_of(&params, body_json.as_ref(), "index")
         .parse::<i64>()
         .ok()
         .filter(|i| *i >= 0);
-    let cache_only = param_of(&params, body_json.as_ref(), "cache")
-        .parse::<i64>()
-        .unwrap_or(0)
-        == 1;
+    let cache_only = refresh
+        || param_of(&params, body_json.as_ref(), "cache")
+            .parse::<i64>()
+            .unwrap_or(0)
+            == 1;
     // legacy 参数：epubContent（1=EPUB XHTML 原文模式）——本地 EPUB 返回基本 HTML 结构
     //（纯文本按段落 <p> 包裹；legacy 章节原文 XHTML 的最小对齐，前端 HTML 渲染直接可用）
     let epub_content = param_of(&params, body_json.as_ref(), "epubContent")
@@ -4136,6 +4185,16 @@ async fn get_book_content(
         == 1;
     if chapter_url.is_empty() {
         return Json(ReturnData::err("请输入章节链接"));
+    }
+    if refresh && book_url.is_empty() {
+        return Json(ReturnData::err("请输入书籍链接"));
+    }
+    if refresh
+        && (book_url.starts_with("local://")
+            || chapter_url.starts_with("local://")
+            || (chapter_url.contains('#') && is_loc_book_file_chapter(&chapter_url)))
+    {
+        return Json(ReturnData::err("本地书不支持单章重新获取"));
     }
     // 本地书（local://）——不走书源解析
     if chapter_url.starts_with("local://") {
@@ -4156,13 +4215,14 @@ async fn get_book_content(
         return Json(ReturnData::err("本地书章节不存在"));
     }
     let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
-    let Some(source) = resolve_book_source_for_url(&state, &namespace, &bs_param, &chapter_url).await else {
+    let Some(source) =
+        resolve_book_source_for_url(&state, &namespace, &bs_param, &chapter_url).await
+    else {
         return Json(ReturnData::err("书源不存在"));
     };
     // ---- 非文本书分派（legacy BookType：0 文本/1 音频/2 漫画/3 文件/4 视频） ----
     // 优先级：客户端显式 type 参数（临时书直读）> 书架书 book_type > 书源 bookSourceType
     let mut book_type = source.book_source_type.clamp(0, 4);
-    let book_url = param_of(&params, body_json.as_ref(), "bookUrl");
     // F12/AR4：书架书实体保留——@get:{bookName} 内建回退源（legacy AnalyzeRule.setBook）
     let mut shelf_book: Option<crate::model::book::Book> = None;
     if !book_url.is_empty() && !book_url.starts_with("local://") {
@@ -4237,10 +4297,16 @@ async fn get_book_content(
         );
     }
     let type_param = param_of(&params, body_json.as_ref(), "type");
+    if refresh && (book_type != 0 || source.book_source_type != 0) {
+        return Json(ReturnData::err("仅支持在线文本书的单章重新获取"));
+    }
     if let Ok(t) = type_param.parse::<i64>() {
         if (0..=4).contains(&t) {
             book_type = t;
         }
+    }
+    if refresh && book_type != 0 {
+        return Json(ReturnData::err("仅支持在线文本书的单章重新获取"));
     }
     match book_type {
         // 音频书：ruleContent 提取音频流 URL（或章节 URL 直链）→ {audioUrl, contentType}
@@ -4347,14 +4413,16 @@ async fn get_book_content(
     // ---- 文本书（type=0）：正文缓存 + ruleContent 文本解析 ----
     // F-10：书源书正文缓存——book_url 为键 + chapter_index = chapterUrl md5 哈希，
     // 同 chapterUrl 直读（永久，清理接口 clearCache 可清）；local:// 键域不参与
-    if !book_url.is_empty() && !book_url.starts_with("local://") {
+    if !refresh && !book_url.is_empty() && !book_url.starts_with("local://") {
         let idx = crate::util::md5::chapter_url_hash(&chapter_url);
         if let Ok(Some(content)) = state
             .storage
             .get_chapter_content(&namespace, &book_url, idx)
             .await
         {
-            if !content.trim().is_empty() {
+            if !content.trim().is_empty()
+                && !crate::service::book::is_source_error_content(&content)
+            {
                 tracing::debug!("getBookContent 命中正文缓存 [{book_url} #{idx}]");
                 // legacy：缓存命中同样保存书架进度（cache=1 纯缓存模式除外）
                 if !cache_only {
@@ -4371,7 +4439,8 @@ async fn get_book_content(
             }
         }
     }
-    match crate::service::book::analyze_content(
+    let deadline = tokio::time::Instant::now() + crate::service::book::CHAPTER_FETCH_BUDGET;
+    let result = crate::service::book::analyze_content_with_retry(
         &namespace,
         &chapter_url,
         &source,
@@ -4379,19 +4448,27 @@ async fn get_book_content(
         chapter_title_ctx,
         book_name_ctx,
         &book_url,
+        retry_count,
     )
-    .await
-    {
+    .await;
+    match result {
         Ok(content) => {
-            let _ = state
-                .storage
-                .record_path_outcome(
+            if tokio::time::Instant::now() >= deadline {
+                return Json(ReturnData::err("章节拉取超过总时限，未更新缓存"));
+            }
+            let _ = tokio::time::timeout_at(
+                deadline,
+                state.storage.record_path_outcome(
                     &namespace,
                     &source.book_source_url,
                     "content",
                     !content.trim().is_empty(),
-                )
-                .await;
+                ),
+            )
+            .await;
+            if tokio::time::Instant::now() >= deadline {
+                return Json(ReturnData::err("章节拉取超过总时限，未更新缓存"));
+            }
             // 抓取成功 → 写回正文缓存（仅书源书且带 bookUrl；CACHECHAPTERCONTENT=false 时跳过）
             if !book_url.is_empty()
                 && !book_url.starts_with("local://")
@@ -4399,10 +4476,23 @@ async fn get_book_content(
             {
                 let idx = crate::util::md5::chapter_url_hash(&chapter_url);
                 let title = param_of(&params, body_json.as_ref(), "title");
-                let _ = state
-                    .storage
-                    .cache_chapter_content(&namespace, &book_url, idx, &title, &content)
-                    .await;
+                if refresh {
+                    if let Err(error) = state
+                        .storage
+                        .refresh_chapter_content(
+                            &namespace, &book_url, idx, &title, &content, deadline,
+                        )
+                        .await
+                    {
+                        tracing::error!("刷新正文缓存写入失败 [{book_url} #{idx}]: {error}");
+                        return Json(ReturnData::err("保存刷新正文失败，已保留原缓存"));
+                    }
+                } else {
+                    let _ = state
+                        .storage
+                        .cache_chapter_content(&namespace, &book_url, idx, &title, &content)
+                        .await;
+                }
                 // legacy：正文读取成功 → 自动保存书架进度（cache=1 纯缓存模式除外）
                 if !cache_only {
                     save_reading_progress_if_shelf(
@@ -4416,7 +4506,8 @@ async fn get_book_content(
                 }
             }
             // 书源使用统计：正文抓取成功
-            bump_source_use(&state, &namespace, &source).await;
+            let _ = tokio::time::timeout_at(deadline, bump_source_use(&state, &namespace, &source))
+                .await;
             Json(ReturnData::ok(serde_json::json!({ "content": content })))
         }
         Err(e) => {
@@ -4425,7 +4516,11 @@ async fn get_book_content(
                 .storage
                 .record_path_outcome(&namespace, &source.book_source_url, "content", false)
                 .await;
-            Json(ReturnData::err("获取正文失败"))
+            Json(ReturnData::err(if refresh {
+                format!("获取正文失败，已保留原缓存：{e}")
+            } else {
+                format!("获取正文失败：{e}")
+            }))
         }
     }
 }
@@ -16799,6 +16894,499 @@ mod tests {
             "local:// 不落正文缓存"
         );
 
+        cleanup(state, dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_refresh_book_content_isolated_cache_and_progress() {
+        use tower::ServiceExt as _;
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
+        struct SourcePrivateGuard(bool);
+        impl Drop for SourcePrivateGuard {
+            fn drop(&mut self) {
+                crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                    .store(self.0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _source = SourcePrivateGuard(
+            crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                .swap(true, std::sync::atomic::Ordering::Relaxed),
+        );
+        let (mut state, dir) = test_state("chapterrefresh").await;
+        state.storage.config.secure = true;
+        state.storage.config.cache_chapter_content = true;
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "chapter-refresh-test".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let failure = "获取数据失败，请稍后再试，错误详情：failed";
+        let base_url = serve_bodies(vec![
+            format!("<div class=\"content\">{failure}</div>"),
+            "<div class=\"content\">新的正文。</div>".into(),
+            format!("<div class=\"content\">{failure}</div>"),
+            format!("<div class=\"content\">{failure}</div>"),
+            "<div class=\"content\">缓存修复正文。</div>".into(),
+            "<div class=\"content\">参数刷新正文。</div>".into(),
+            "<div class=\"content\">无缓存模式正文。</div>".into(),
+            "<div class=\"content\">写回失败的正文。</div>".into(),
+            format!("<div class=\"content\">{failure}</div>"),
+            "<div class=\"content\">GET 接口刷新正文。</div>".into(),
+        ])
+        .await;
+        let base = base_url.trim_end_matches("/sources.json").to_string();
+        state
+            .storage
+            .save_book_source(
+                "alice",
+                &crate::model::BookSource {
+                    book_source_url: base.clone(),
+                    rule_content: Some(json!({"content": "div.content@text"})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let book_url = "https://book.example/refresh";
+        let chapter_url = format!("{base}/chapter1");
+        let index = crate::util::md5::chapter_url_hash(&chapter_url);
+        let other_index = crate::util::md5::chapter_url_hash(&format!("{base}/chapter2"));
+        for (namespace, cache_index, content) in [
+            ("alice", index, "原来的正文。"),
+            ("alice", other_index, "其他章节。"),
+            ("bob", index, "其他用户的正文。"),
+        ] {
+            state
+                .storage
+                .cache_chapter_content(namespace, book_url, cache_index, "标题", content)
+                .await
+                .unwrap();
+        }
+        state
+            .storage
+            .upsert_book(
+                "alice",
+                &crate::model::book::Book {
+                    book_url: book_url.into(),
+                    name: "刷新测试".into(),
+                    origin: base.clone(),
+                    dur_chapter_index: 7,
+                    dur_chapter_pos: 123,
+                    dur_chapter_time: 456,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .cache_toc("alice", book_url, book_url, "[]")
+            .await
+            .unwrap();
+        let app = router(state.storage.config.clone(), state.storage.clone());
+        let request_body = |retry_count: usize| {
+            json!({
+                "url": chapter_url,
+                "bookUrl": book_url,
+                "bookSource": base,
+                "index": 0,
+                "title": "第一章",
+                "retryCount": retry_count,
+                "cache": 0,
+                "refresh": 0,
+            })
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/reader3/refreshBookContent")
+                    .header("content-type", "application/json")
+                    .header("accessToken", "alice:chapter-refresh-test")
+                    .body(Body::from(request_body(1).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["isSuccess"], true, "{response}");
+        assert_eq!(response["data"]["content"], "新的正文。");
+        for (namespace, cache_index, content) in [
+            ("alice", index, "新的正文。"),
+            ("alice", other_index, "其他章节。"),
+            ("bob", index, "其他用户的正文。"),
+        ] {
+            assert_eq!(
+                state
+                    .storage
+                    .get_chapter_content(namespace, book_url, cache_index)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(content)
+            );
+        }
+        for retry_count in [0, 0] {
+            let response = refresh_book_content(
+                AxumState(state.clone()),
+                Query(HashMap::from([(
+                    "accessToken".into(),
+                    "alice:chapter-refresh-test".into(),
+                )])),
+                HeaderMap::new(),
+                Some(Bytes::from(request_body(retry_count).to_string())),
+            )
+            .await;
+            assert!(!response.0.is_success);
+            assert!(response.0.error_msg.contains("共尝试 1 次"));
+            assert_eq!(
+                state
+                    .storage
+                    .get_chapter_content("alice", book_url, index)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("新的正文。")
+            );
+        }
+        let book = state
+            .storage
+            .find_book("alice", book_url)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                book.dur_chapter_index,
+                book.dur_chapter_pos,
+                book.dur_chapter_time
+            ),
+            (7, 123, 456)
+        );
+        state
+            .storage
+            .cache_chapter_content("alice", book_url, index, "标题", failure)
+            .await
+            .unwrap();
+        let auth = HashMap::from([("accessToken".into(), "alice:chapter-refresh-test".into())]);
+        let response = get_book_content(
+            AxumState(state.clone()),
+            Query(auth.clone()),
+            HeaderMap::new(),
+            Some(Bytes::from(request_body(0).to_string())),
+        )
+        .await;
+        assert!(response.0.is_success, "{}", response.0.error_msg);
+        assert_eq!(response.0.data["content"], "缓存修复正文。");
+        let mut body = request_body(0);
+        body["refresh"] = json!(true);
+        let response = get_book_content(
+            AxumState(state.clone()),
+            Query(auth.clone()),
+            HeaderMap::new(),
+            Some(Bytes::from(body.to_string())),
+        )
+        .await;
+        assert!(response.0.is_success, "{}", response.0.error_msg);
+        assert_eq!(response.0.data["content"], "参数刷新正文。");
+        state.storage.config.cache_chapter_content = false;
+        let response = refresh_book_content(
+            AxumState(state.clone()),
+            Query(auth),
+            HeaderMap::new(),
+            Some(Bytes::from(request_body(0).to_string())),
+        )
+        .await;
+        assert!(response.0.is_success, "{}", response.0.error_msg);
+        assert_eq!(response.0.data["content"], "无缓存模式正文。");
+        state.storage.config.cache_chapter_content = true;
+        sqlx::query("CREATE TRIGGER reject_chapter_refresh BEFORE INSERT ON book_chapters BEGIN SELECT RAISE(ABORT, 'test cache failure'); END")
+            .execute(&state.storage.pool)
+            .await
+            .unwrap();
+        let response = refresh_book_content(
+            AxumState(state.clone()),
+            Query(HashMap::from([(
+                "accessToken".into(),
+                "alice:chapter-refresh-test".into(),
+            )])),
+            HeaderMap::new(),
+            Some(Bytes::from(request_body(0).to_string())),
+        )
+        .await;
+        assert!(!response.0.is_success);
+        assert_eq!(response.0.error_msg, "保存刷新正文失败，已保留原缓存");
+        assert_eq!(
+            state
+                .storage
+                .get_chapter_content("alice", book_url, index)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("参数刷新正文。")
+        );
+        let book = state
+            .storage
+            .find_book("alice", book_url)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((book.dur_chapter_index, book.dur_chapter_pos), (0, 123));
+        assert!(state
+            .storage
+            .get_toc_cache("alice", book_url, i64::MAX)
+            .await
+            .unwrap()
+            .is_some());
+        sqlx::query("DROP TRIGGER reject_chapter_refresh")
+            .execute(&state.storage.pool)
+            .await
+            .unwrap();
+        let mut get_url = reqwest::Url::parse("http://reader.example/reader3/refreshBookContent")
+            .unwrap();
+        get_url
+            .query_pairs_mut()
+            .append_pair("chapterUrl", &chapter_url)
+            .append_pair("bookUrl", book_url)
+            .append_pair("bookSource", &base)
+            .append_pair("title", "第一章")
+            .append_pair("index", "0")
+            .append_pair("retryCount", "1")
+            .append_pair("refresh", "0")
+            .append_pair("cache", "0");
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/reader3/refreshBookContent?{}",
+                        get_url.query().unwrap()
+                    ))
+                    .header("authorization", "Bearer alice:chapter-refresh-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["isSuccess"], true, "{response}");
+        assert_eq!(response["data"]["content"], "GET 接口刷新正文。");
+        for (namespace, cache_index, content) in [
+            ("alice", index, "GET 接口刷新正文。"),
+            ("alice", other_index, "其他章节。"),
+            ("bob", index, "其他用户的正文。"),
+        ] {
+            assert_eq!(
+                state
+                    .storage
+                    .get_chapter_content(namespace, book_url, cache_index)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(content)
+            );
+        }
+        let book = state
+            .storage
+            .find_book("alice", book_url)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((book.dur_chapter_index, book.dur_chapter_pos), (0, 123));
+        assert!(state
+            .storage
+            .get_toc_cache("alice", book_url, i64::MAX)
+            .await
+            .unwrap()
+            .is_some());
+        cleanup(state, dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_refresh_book_content_public_api_authentication() {
+        use tower::ServiceExt as _;
+        let (mut state, dir) = test_state("refreshpublicapi").await;
+        state.storage.config.secure = true;
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "public-refresh-test".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let app = router(state.storage.config.clone(), state.storage.clone());
+        for method in ["GET", "POST"] {
+            for (token_query, auth_header, expected_error) in [
+                ("", None, "请登录后使用"),
+                (
+                    "",
+                    Some(("authorization", "Bearer alice:wrong-token")),
+                    "请登录后使用",
+                ),
+                (
+                    "",
+                    Some(("authorization", "Bearer alice:public-refresh-test")),
+                    "重试次数必须是 0 到 5 的整数",
+                ),
+                (
+                    "",
+                    Some(("accessToken", "alice:public-refresh-test")),
+                    "重试次数必须是 0 到 5 的整数",
+                ),
+                (
+                    "&accessToken=alice%3Apublic-refresh-test",
+                    None,
+                    "重试次数必须是 0 到 5 的整数",
+                ),
+            ] {
+                let query_retry = if method == "GET" { 6 } else { 0 };
+                let mut request = axum::http::Request::builder().method(method).uri(format!(
+                    "/reader3/refreshBookContent?retryCount={query_retry}{token_query}"
+                ));
+                if let Some((name, value)) = auth_header {
+                    request = request.header(name, value);
+                }
+                let body = if method == "POST" {
+                    request = request.header("content-type", "application/json");
+                    Body::from(json!({"retryCount": 6}).to_string())
+                } else {
+                    Body::empty()
+                };
+                let response = app
+                    .clone()
+                    .oneshot(request.body(body).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response.headers()[axum::http::header::CACHE_CONTROL],
+                    "no-store"
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap();
+                let response: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(response["isSuccess"], false);
+                assert_eq!(response["errorMsg"], expected_error);
+                assert_eq!(
+                    response["data"],
+                    if expected_error == "请登录后使用" {
+                        json!("NEED_LOGIN")
+                    } else {
+                        Value::Null
+                    }
+                );
+            }
+        }
+        cleanup(state, dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_refresh_book_content_validation() {
+        let (mut state, dir) = test_state("refreshvalidation").await;
+        for (body, message) in [
+            (json!({}), "请输入章节链接"),
+            (
+                json!({"url": "https://book.example/chapter"}),
+                "请输入书籍链接",
+            ),
+            (
+                json!({"url": "local://book/0", "bookUrl": "local://book"}),
+                "本地书不支持单章重新获取",
+            ),
+            (
+                json!({"url": "storage/book.txt#0", "bookUrl": "storage/book.txt"}),
+                "本地书不支持单章重新获取",
+            ),
+        ] {
+            let response = refresh_book_content(
+                AxumState(state.clone()),
+                Query(HashMap::new()),
+                HeaderMap::new(),
+                Some(Bytes::from(body.to_string())),
+            )
+            .await;
+            assert_eq!(response.0.error_msg, message);
+        }
+        for count in [json!(-1), json!(6), json!(1.5), json!("bad")] {
+            let body = json!({
+                "url": "https://book.example/chapter", "bookUrl": "https://book.example", "retryCount": count
+            });
+            let response = refresh_book_content(
+                AxumState(state.clone()),
+                Query(HashMap::new()),
+                HeaderMap::new(),
+                Some(Bytes::from(body.to_string())),
+            )
+            .await;
+            assert_eq!(response.0.error_msg, "重试次数必须是 0 到 5 的整数");
+        }
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: "https://book.example".into(),
+                    book_source_type: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let response = refresh_book_content(
+            AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(),
+            Some(Bytes::from(json!({
+                "url": "https://book.example/chapter", "bookUrl": "https://book.example/book", "bookSource": "https://book.example"
+            }).to_string())),
+        ).await;
+        assert_eq!(response.0.error_msg, "仅支持在线文本书的单章重新获取");
+        let response = refresh_book_content(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            Some(Bytes::from(
+                json!({
+                    "url": "https://book.example/chapter", "bookUrl": "https://book.example/book",
+                    "bookSource": "https://book.example", "type": 0
+                })
+                .to_string(),
+            )),
+        )
+        .await;
+        assert_eq!(response.0.error_msg, "仅支持在线文本书的单章重新获取");
+        state.storage.config.secure = true;
+        let response = refresh_book_content(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert!(!response.0.is_success);
+        assert_eq!(response.0.error_msg, login_required().error_msg);
         cleanup(state, dir).await;
     }
 

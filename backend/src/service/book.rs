@@ -3,7 +3,7 @@
 //! 对齐 legacy WebBook：getBookInfo / getChapterList / getBookContent
 //! v1：CSS/JSONPath/JS（简单）规则；多页目录/正文（nextTocUrl/nextContentUrl）循环支持
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::Deserialize;
 
 use crate::model::book_chapter::{BookChapter, BookInfo};
@@ -1149,7 +1149,7 @@ pub async fn analyze_content(
     book_name: Option<&str>,
     book_url: &str,
 ) -> Result<String> {
-    match analyze_content_impl(
+    analyze_content_with_retry(
         ns,
         chapter_url,
         source,
@@ -1157,9 +1157,126 @@ pub async fn analyze_content(
         chapter_title,
         book_name,
         book_url,
+        chapter_retry_count(),
     )
     .await
-    {
+}
+
+pub const MAX_CHAPTER_RETRIES: usize = 5;
+pub const CHAPTER_FETCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(110);
+
+pub fn chapter_retry_count() -> usize {
+    std::env::var("READER_CHAPTER_RETRIES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(2)
+        .min(MAX_CHAPTER_RETRIES)
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ChapterContentError {
+    #[error("书源返回了获取数据失败提示，而非章节正文")]
+    SourceFailure,
+    #[error("书源返回的章节正文为空")]
+    Empty,
+    #[error("章节请求返回 HTTP {0}")]
+    HttpStatus(u16),
+    #[error("章节拉取超过 110 秒总时限")]
+    Deadline,
+}
+
+pub(crate) fn is_source_error_content(content: &str) -> bool {
+    let text = html_content_to_text(content);
+    if text.chars().count() > 512 {
+        return false;
+    }
+    let text: String = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let text = text.trim_end_matches(['。', '.', '！', '!']);
+    let Some(rest) = text.strip_prefix("获取数据失败") else {
+        return false;
+    };
+    let rest = rest.trim_start_matches(['，', ',', '。', '.', '：', ':']);
+    let Some(rest) = rest.strip_prefix("请稍后再试") else {
+        return false;
+    };
+    let rest = rest.trim_start_matches(['，', ',', '。', '.', '：', ':']);
+    let Some(detail) = rest.strip_prefix("错误详情") else {
+        return false;
+    };
+    let Some(detail) = detail.strip_prefix('：').or_else(|| detail.strip_prefix(':')) else {
+        return false;
+    };
+    !detail.is_empty()
+        && detail.chars().all(|character| {
+            character.is_ascii_alphanumeric() || "_-. :()/".contains(character)
+        })
+}
+
+fn retryable_chapter_error(error: &anyhow::Error) -> bool {
+    match error.downcast_ref::<ChapterContentError>() {
+        Some(ChapterContentError::SourceFailure | ChapterContentError::Empty) => true,
+        Some(ChapterContentError::HttpStatus(status)) => {
+            matches!(*status, 408 | 429 | 500..=599)
+        }
+        Some(ChapterContentError::Deadline) => false,
+        None => crawler::retryable_http_error(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn analyze_content_with_retry(
+    ns: &str,
+    chapter_url: &str,
+    source: &BookSource,
+    max_pages: usize,
+    chapter_title: Option<&str>,
+    book_name: Option<&str>,
+    book_url: &str,
+    retry_count: usize,
+) -> Result<String> {
+    let retries = retry_count.min(MAX_CHAPTER_RETRIES);
+    let mut attempts = 0;
+    let deadline = tokio::time::Instant::now() + CHAPTER_FETCH_BUDGET;
+    let result = tokio::time::timeout_at(deadline, async {
+        for attempt in 0..=retries {
+            attempts += 1;
+            match analyze_content_impl(
+                ns,
+                chapter_url,
+                source,
+                max_pages,
+                chapter_title,
+                book_name,
+                book_url,
+                deadline,
+            )
+            .await
+            {
+                Ok(content) => {
+                    ensure_chapter_deadline(deadline)?;
+                    return Ok(content);
+                }
+                Err(error) => {
+                    if attempt == retries || !retryable_chapter_error(&error) {
+                        return Err(error);
+                    }
+                    tracing::warn!(
+                        "章节正文无效，重试 {}/{} [{chapter_url}]: {error:#}",
+                        attempt + 1,
+                        retries
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(200 << attempt)).await;
+                }
+            }
+        }
+        Err(anyhow!("章节重试耗尽"))
+    })
+    .await
+    .unwrap_or_else(|_| Err(ChapterContentError::Deadline.into()));
+    match result {
         Ok(v) => {
             crate::service::health::clear_source_invalid(ns, &source.book_source_url);
             Ok(v)
@@ -1170,11 +1287,19 @@ pub async fn analyze_content(
                 &source.book_source_url,
                 &e.to_string(),
             );
-            Err(e)
+            Err(e.context(format!("章节拉取失败（共尝试 {attempts} 次）")))
         }
     }
 }
 
+fn ensure_chapter_deadline(deadline: tokio::time::Instant) -> Result<()> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(ChapterContentError::Deadline.into());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn analyze_content_impl(
     ns: &str,
     chapter_url: &str,
@@ -1183,6 +1308,7 @@ async fn analyze_content_impl(
     chapter_title: Option<&str>,
     book_name: Option<&str>,
     book_url: &str,
+    deadline: tokio::time::Instant,
 ) -> Result<String> {
     let mut parts: Vec<String> = Vec::new();
     let mut current_url = chapter_url.to_string();
@@ -1200,11 +1326,20 @@ async fn analyze_content_impl(
     vars.chapter_url = Some(chapter_url.to_string());
 
     for _page in 0..max_pages {
+        ensure_chapter_deadline(deadline)?;
         let resp = fetch_url(ns, &current_url, source).await?;
+        ensure_chapter_deadline(deadline)?;
+        if resp.status >= 400 {
+            return Err(ChapterContentError::HttpStatus(resp.status).into());
+        }
         let base = resp.url.clone();
         // E10/AR5：真实页 URL → JS 求值绑定 baseUrl
         vars.insert("baseUrl".to_string(), base.clone());
         let content = analyze_content_from_with_vars(&resp.body, source, &mut vars);
+        ensure_chapter_deadline(deadline)?;
+        if is_source_error_content(&content) {
+            return Err(ChapterContentError::SourceFailure.into());
+        }
         if !content.is_empty() {
             parts.push(content);
         }
@@ -1232,12 +1367,14 @@ async fn analyze_content_impl(
         }
         // E7：翻页 URL 过模板/JS 管线后再绝对化
         let next = expand_next_url(&next, &base, source, ns);
+        ensure_chapter_deadline(deadline)?;
         current_url = to_abs(&next, &base);
         crate::parser::rule::save_book_vars(ns, &source.book_source_url, &current_url, &vars);
     }
 
     // P1 双键回写：章节键 + book_url 键（后续其他章节直接取正文时 book 级仍可见——
     // legacy 单 varMap 书级语义）
+    ensure_chapter_deadline(deadline)?;
     crate::parser::rule::save_book_vars_two_level(
         ns,
         &source.book_source_url,
@@ -1245,7 +1382,11 @@ async fn analyze_content_impl(
         chapter_url,
         &vars,
     );
-    Ok(parts.join("\n"))
+    let content = parts.join("\n");
+    if content.trim().is_empty() {
+        return Err(ChapterContentError::Empty.into());
+    }
+    Ok(content)
 }
 
 /// 单页正文解析（纯函数，可测）
@@ -1736,6 +1877,75 @@ mod init_rule_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_source_error_content_detection() {
+        let failure = "获取数据失败，请稍后再试，错误详情：failed";
+        assert!(is_source_error_content(failure));
+        assert!(is_source_error_content(&format!("<p>{failure}</p>")));
+        assert!(is_source_error_content(
+            "获取数据失败， 请稍后再试，\n错误详情：timeout"
+        ));
+        assert!(!is_source_error_content("他叹了口气说：获取数据失败。"));
+        assert!(!is_source_error_content("failed"));
+        assert!(!is_source_error_content(&format!(
+            "屏幕显示“{failure}”，他便关掉手机。"
+        )));
+        assert!(!is_source_error_content(&format!("“{failure}”")));
+        assert!(!is_source_error_content(&format!(
+            "{}{failure}",
+            "正常正文。".repeat(120)
+        )));
+    }
+
+    #[test]
+    fn test_chapter_retry_error_classification() {
+        assert!(!retryable_chapter_error(
+            &ChapterContentError::Deadline.into()
+        ));
+        assert!(retryable_chapter_error(
+            &ChapterContentError::SourceFailure.into()
+        ));
+        assert!(retryable_chapter_error(&ChapterContentError::Empty.into()));
+        for status in [408, 429, 500, 503] {
+            assert!(retryable_chapter_error(
+                &ChapterContentError::HttpStatus(status).into()
+            ));
+        }
+        for status in [400, 401, 403, 404] {
+            assert!(!retryable_chapter_error(
+                &ChapterContentError::HttpStatus(status).into()
+            ));
+        }
+        assert!(!retryable_chapter_error(&anyhow!(
+            "目标 localhost 为回环地址，已拦截"
+        )));
+        assert!(!retryable_chapter_error(&anyhow!(
+            "invalid peer certificate"
+        )));
+        assert!(retryable_chapter_error(&anyhow!("connection reset")));
+    }
+
+    #[tokio::test]
+    async fn test_chapter_expired_deadline_fails_before_fetch() {
+        let source = test_source();
+        let error = analyze_content_impl(
+            "default",
+            "http://127.0.0.1:1/chapter",
+            &source,
+            1,
+            None,
+            None,
+            "book",
+            tokio::time::Instant::now() - std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ChapterContentError>(),
+            Some(ChapterContentError::Deadline)
+        ));
+    }
 
     fn test_source() -> BookSource {
         BookSource {

@@ -94,6 +94,8 @@ docker compose up -d          # 默认单用户模式, 无需 .env
 - **TTS 朗读**(可选 TTS 网关, 见下); 书签 + 划选批注; 章末块导航
 - 阅读进度多端同步; 书架卡片显示阅读进度与未读
 - 正文/目录/书籍信息多级缓存, 未命中自动抓取并回写
+- **单章刷新**: 阅读顶栏的刷新按钮可重新抓取当前章, 可选失败后重试 0–5 次; 失败保留原正文和进度, 不清空整本缓存
+- **错误正文修复**: 识别「获取数据失败，请稍后再试，错误详情：…」这类短错误正文; 已缓存的错误提示也会绕过缓存重新获取
 
 ### 书架与缓存
 
@@ -143,6 +145,7 @@ compose 默认挂 `deploy/storage/`(容器内 `/storage/storage`), 内含:
 | `READER_DB_BACKUP` | 1 | 启动前 db 快照开关(0 关) |
 | `READER_AUTO_BACKUP_HOUR` | 3 | 每日 WebDAV zip 备份时刻(0-23) |
 | `READER_HTTP_RETRIES` | 2 | 搜索/抓取单源重试次数(compose 默认 1, 死源排空更快) |
+| `READER_CHAPTER_RETRIES` | 2 | 章节正文失败后的额外重试次数(0–5, 超出上限按 5); 覆盖错误提示正文、空正文、临时 HTTP 错误与传输失败, 整章抓取总时限 110s |
 | `SSRF_ALLOW_PRIVATE` | false | 图片代理/TTS/登录检测允许私网地址(内网 TTS 等自建场景) |
 | `READER_ALLOW_PRIVATE_SOURCE` | false | 书源抓取允许私网/回环地址(局域网书源、本地测试源才开; 默认拦截防 SSRF) |
 | `READER_DICT_ONLINE` | 1 | 词典在线兜底开关(本地未命中时有道查询, 缓存 30 天) |
@@ -151,6 +154,77 @@ compose 默认挂 `deploy/storage/`(容器内 `/storage/storage`), 内含:
 | `READER_BROWSER_FIRST` | 1 | 抓取优先经浏览器反检测; 0 恢复直连优先 |
 
 **运行时可调(无需重启/重建)**: 设置页「搜索 → 单源搜索超时」(3-60s, 即时保存, 随每次搜索请求下发)。
+
+### 单章重新获取接口
+
+`POST/GET /reader3/refreshBookContent` 与 `getBookshelf`、`searchBook` 共用同一公共 `/reader3` API 入口, 外部客户端可直接调用, 无需阅读前端; 复用正文接口的鉴权、书源规则和缓存键。推荐 **POST JSON**, GET 仅作兼容, 参数通过 query 传递。
+
+#### 鉴权
+
+- **secure 模式**: 使用登录返回的完整 `accessToken`, 通过 `Authorization: Bearer <accessToken>` 或 `accessToken: <accessToken>` header 认证; 也支持 `accessToken` query 参数。推荐 header, 避免 token 出现在 URL 中; **token 不支持放在 JSON body 中**。
+- **非 secure 模式**: 无需登录, 共用 `default` 命名空间的书源和缓存。
+
+#### 参数
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `bookUrl` | 字符串 | 是 | 书籍链接, 用于定位本书的章节缓存 |
+| `url` / `chapterUrl` | 字符串 | 至少其一 | 章节链接; 两者都传时优先使用 `chapterUrl` |
+| `bookSource` | 书源 URL 或完整书源 JSON | 否 | URL 用于查找已存书源; POST 可传 JSON 对象, GET 可传 JSON 字符串 |
+| `index` | 非负整数 | 否 | 章节索引, 从 0 开始; 刷新不更新阅读进度 |
+| `title` | 字符串 | 否 | 章节标题, 供书源规则使用 |
+| `retryCount` | 整数, 0–5 | 否 | 首次尝试之外的额外尝试次数; 省略使用 `READER_CHAPTER_RETRIES` |
+
+省略 `bookSource` 时, 先按**章节链接的域名**匹配已存书源, 无同域匹配时回退既有书源查询(`resolve_book_source`); 不从书架 `origin` 推断。
+
+POST JSON 示例:
+
+```json
+{
+  "bookUrl": "https://example.com/book/123",
+  "url": "https://example.com/book/123/chapter/1",
+  "bookSource": "https://example.com",
+  "index": 0,
+  "title": "第一章",
+  "retryCount": 2
+}
+```
+
+#### curl 调用示例
+
+以下地址和 token 均为占位符; secure 模式将 `ACCESS_TOKEN` 替换为登录返回值, 非 secure 模式可省略认证 header。
+
+```bash
+BASE_URL=http://reader.example.invalid
+ACCESS_TOKEN='<ACCESS_TOKEN>'
+
+curl --silent --show-error --max-time 120 \
+  --request POST "$BASE_URL/reader3/refreshBookContent" \
+  --header "Authorization: Bearer $ACCESS_TOKEN" \
+  --header 'Content-Type: application/json' \
+  --data '{"bookUrl":"https://example.invalid/book/123","url":"https://example.invalid/book/123/chapter/1","retryCount":2}'
+
+curl --silent --show-error --max-time 120 \
+  --get "$BASE_URL/reader3/refreshBookContent" \
+  --header "accessToken: $ACCESS_TOKEN" \
+  --data-urlencode 'bookUrl=https://example.invalid/book/123' \
+  --data-urlencode 'chapterUrl=https://example.invalid/book/123/chapter/1' \
+  --data-urlencode 'retryCount=2'
+```
+
+GET 同样会回源并可能写回章节缓存, 是**有副作用的兼容方法**, 因此仍推荐 POST。GET/POST 的 HTTP 响应均带 `Cache-Control: no-store`, 客户端和代理不得缓存该响应。客户端超时建议 **至少 120s**(示例为 `--max-time 120`), 服务端现有 110s 协作式抓取预算见下。
+
+#### 响应、重试与缓存
+
+响应统一使用 `isSuccess` / `errorMsg` / `data` envelope。**业务错误也可能返回 HTTP 200**, 必须判断 `isSuccess`, 失败时读取 `errorMsg`, 不要仅凭 HTTP 状态或 curl 退出码判断成功。一般失败返回如 `{ "isSuccess": false, "errorMsg": "书源不存在", "data": null }`; 未登录或 token 无效/过期时返回 `{ "isSuccess": false, "errorMsg": "请登录后使用", "data": "NEED_LOGIN" }`。
+
+- `url` 也可使用 `chapterUrl`; `bookUrl` 必填。只支持在线文本书, 不支持本地文件及音频/漫画/视频书。
+- `retryCount` 是首次尝试之外的重试次数, 0 表示只抓取一次、2 表示最多尝试三次; 省略则用 `READER_CHAPTER_RETRIES`。阅读刷新弹窗默认 2, 可选 0–5, 当前选择仅保留在本次阅读页面。
+- 成功返回 `{ "isSuccess": true, "errorMsg": "", "data": { "content": "新正文" } }`; 只替换当前用户、当前书、当前章节的缓存, 不变更目录、其他章节或阅读进度。
+- 抓取失败、空正文或源站错误提示不会覆盖旧缓存。`READER_APP_CACHECHAPTERCONTENT=false` 时返回新正文但不写服务端缓存。
+- 现有 `POST/GET /reader3/getBookContent` 同样支持 `refresh=1` / `true` 和 `retryCount`; 不传 `refresh` 时仍优先用有效缓存, 发现上述错误提示缓存则自动回源。
+- 章节重试从本章第一页重新执行规则与分页抓取, 指数退避 200ms 起, 总时限 110s。底层 `READER_HTTP_RETRIES` 和书源 URL option `retry` 是独立的传输层重试, 因此一次章节尝试可能包含多次 HTTP 请求。
+- 110s 是协作式抓取预算: 同步书源 JS 不能强行中断, 但超时结果不接受为成功; 写回在事务内检查期限, 提交前超时回滚, 一旦开始提交则等待数据库确认结果。
 
 **后端改动本地验证(不等 GH 镜像)**: `scripts/dev-backend.sh`(增量 debug 编译 + 临时实例 :4599 独立 storage) /
 `scripts/dev-backend.sh smoke`(冒烟: index/注册登录/书架) / `stop` 停止。GH Actions 只出发布镜像;

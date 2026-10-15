@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { proxiedAssetUrl } from "@/lib/asset";
-import { parseWith, post, type ApiRequestConfig } from "@/lib/api-client";
+import { ApiError, parseWith, post, type ApiRequestConfig } from "@/lib/api-client";
 import {
   bookChapterListSchema,
   bookSchema,
@@ -53,6 +53,7 @@ export interface BookContentOptions extends BookSourceHint {
   bookUrl?: string;
   /** 章节标题: 规则上下文 @get:{title} */
   title?: string;
+  retryCount?: number;
 }
 
 export async function getBookInfo(
@@ -84,6 +85,42 @@ export async function getChapterList(
   return parseWith(bookChapterListSchema, data);
 }
 
+function bookContentPayload(
+  url: string,
+  index: number,
+  options?: BookContentOptions,
+) {
+  if (options?.retryCount !== undefined
+    && (!Number.isInteger(options.retryCount) || options.retryCount < 0 || options.retryCount > 5)) {
+    throw new ApiError("重试次数须为 0–5 的整数");
+  }
+  return {
+    url,
+    index,
+    refresh: options?.refresh ? 1 : undefined,
+    cache: options?.cache ? 1 : undefined,
+    bookSource: options?.bookSourceUrl,
+    bookUrl: options?.bookUrl,
+    title: options?.title,
+    retryCount: options?.retryCount,
+  };
+}
+
+async function requestBookContent(
+  endpoint: "/getBookContent" | "/refreshBookContent",
+  url: string,
+  index: number,
+  options?: BookContentOptions,
+  config?: ApiRequestConfig,
+): Promise<BookContent> {
+  const data = await post<unknown>(
+    endpoint,
+    bookContentPayload(url, index, options),
+    { timeout: FETCH_TIMEOUT, ...config },
+  );
+  return parseWith(bookContentSchema, data);
+}
+
 /** warp 契约: url = 章节页 URL (chapterUrl), index 仅用于回写书架进度; Kotlin 旧形 bookUrl+index 已废 */
 export async function getBookContent(
   url: string,
@@ -91,20 +128,20 @@ export async function getBookContent(
   options?: BookContentOptions,
   config?: ApiRequestConfig,
 ): Promise<BookContent> {
-  const data = await post<unknown>(
-    "/getBookContent",
-    {
-      url,
-      index,
-      refresh: options?.refresh ? 1 : undefined,
-      cache: options?.cache ? 1 : undefined,
-      bookSource: options?.bookSourceUrl,
-      bookUrl: options?.bookUrl,
-      title: options?.title,
-    },
-    { timeout: FETCH_TIMEOUT, ...config },
-  );
-  return parseWith(bookContentSchema, data);
+  return requestBookContent("/getBookContent", url, index, options, config);
+}
+
+export async function refreshBookContent(
+  url: string,
+  index: number,
+  options?: Omit<BookContentOptions, "refresh" | "cache">,
+  config?: ApiRequestConfig,
+): Promise<BookContent> {
+  const content = await requestBookContent("/refreshBookContent", url, index, options, config);
+  if (content.content.trim() === "") {
+    throw new ApiError("章节正文为空，已保留原内容");
+  }
+  return content;
 }
 
 /** 保存阅读进度到书架(章节内位置由后端按章节列表写入) */

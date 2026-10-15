@@ -13,6 +13,7 @@ import {
   Maximize2,
   Minimize2,
   Moon,
+  RefreshCw,
   Settings2,
   Sun,
 } from "lucide-react";
@@ -45,6 +46,9 @@ export interface ReaderTopBarProps {
   /** 本章阅读进度百分比 (0-100), 驱动栏底进度条 */
   percent: number;
   onBack: () => void;
+  canRefresh: boolean;
+  isRefreshing: boolean;
+  onRefresh: () => void;
   /** 本章是否已有书签 */
   bookmarked: boolean;
   onToggleBookmark: () => void;
@@ -83,6 +87,9 @@ export function ReaderTopBar({
   chapterTitle,
   percent,
   onBack,
+  canRefresh,
+  isRefreshing,
+  onRefresh,
   bookmarked,
   onToggleBookmark,
   inShelf,
@@ -113,8 +120,8 @@ export function ReaderTopBar({
       )}
     >
       {/* 图标多, 小屏收紧间距并降一档按钮尺寸, 保住书名/章节的展示宽度 */}
-      <div className="mx-auto flex h-14 max-w-3xl items-center gap-0.5 px-2 sm:gap-2 sm:px-4">
-        <IconButton variant="ghost" tooltip="返回" tooltipSide="bottom" onClick={onBack}>
+      <div className="mx-auto flex h-14 max-w-3xl items-center gap-0 px-1 sm:gap-2 sm:px-4 [&_button]:size-7 sm:[&_button]:size-8">
+        <IconButton variant="ghost" size="sm" tooltip="返回" tooltipSide="bottom" onClick={onBack}>
           <ArrowLeft />
         </IconButton>
 
@@ -123,6 +130,18 @@ export function ReaderTopBar({
           <p className="truncate text-xs text-muted-foreground">{chapterTitle}</p>
         </div>
 
+        <IconButton
+          variant="ghost"
+          size="sm"
+          aria-label="刷新本章"
+          aria-busy={isRefreshing || undefined}
+          tooltip={isRefreshing ? "正在刷新本章…" : "重新抓取本章正文"}
+          tooltipSide="bottom"
+          disabled={!canRefresh || isRefreshing}
+          onClick={onRefresh}
+        >
+          <RefreshCw aria-hidden className={cn(isRefreshing && "animate-spin motion-reduce:animate-none")} />
+        </IconButton>
         <IconButton
           variant="ghost"
           size="sm"
