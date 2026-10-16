@@ -164,7 +164,7 @@ export type AvailableBookSource = z.infer<typeof availableBookSourceSchema>;
 /**
  * 某本书当前可用的书源列表(换源候选).
  * @param bookUrl 书架上这本书的 bookUrl(书不在书架且无缓存时后端返回「书籍信息错误」)
- * @param refresh true 时后端用全部书源重新搜索该书(慢), 缺省只读缓存
+ * @param refresh true 时后端用全部启用且可搜索的书源重新搜索该书(慢); 缺省优先读取非空缓存, 缓存为空时自动搜索
  */
 export async function getAvailableBookSource(
   bookUrl: string,

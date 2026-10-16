@@ -4219,16 +4219,53 @@ async fn get_book_content_impl(
     };
     // ---- 非文本书分派（legacy BookType：0 文本/1 音频/2 漫画/3 文件/4 视频） ----
     // 优先级：客户端显式 type 参数（临时书直读）> 书架书 book_type > 书源 bookSourceType
-    let mut book_type = source.book_source_type.clamp(0, 4);
+    let source_type = source.book_source_type;
+    if !(0..=4).contains(&source_type) {
+        return Json(ReturnData::err("不支持的书源类型"));
+    }
+    let mut book_type = source_type;
     // F12/AR4：书架书实体保留——@get:{bookName} 内建回退源（legacy AnalyzeRule.setBook）
     let mut shelf_book: Option<crate::model::book::Book> = None;
     if !book_url.is_empty() && !book_url.starts_with("local://") {
         if let Ok(Some(b)) = state.storage.find_book(&namespace, &book_url).await {
+            let Some(shelf_type) = crate::model::book_type::content_type(b.book_type) else {
+                return Json(ReturnData::err("不支持的书籍类型"));
+            };
             if b.book_type > 0 {
-                book_type = b.book_type.clamp(0, 4);
+                book_type = shelf_type;
             }
             shelf_book = Some(b);
         }
+    }
+    let type_param = param_of(&params, body_json.as_ref(), "type");
+    let explicit_type = if type_param.is_empty() {
+        None
+    } else {
+        let Some(parsed) = type_param
+            .parse::<i64>()
+            .ok()
+            .filter(|value| crate::model::book_type::content_type(*value).is_some())
+        else {
+            return Json(ReturnData::err("不支持的书籍类型"));
+        };
+        Some(parsed)
+    };
+    if refresh
+        && (book_type != 0
+            || source_type != 0
+            || shelf_book
+                .as_ref()
+                .map(|book| crate::model::book_type::is_local(book.book_type))
+                .unwrap_or(false)
+            || explicit_type.map(crate::model::book_type::is_local).unwrap_or(false))
+    {
+        return Json(ReturnData::err("仅支持在线文本书的单章重新获取"));
+    }
+    if let Some(value) = explicit_type {
+        book_type = crate::model::book_type::content_type(value).unwrap();
+    }
+    if refresh && book_type != 0 {
+        return Json(ReturnData::err("仅支持在线文本书的单章重新获取"));
     }
     // 章节标题（客户端随请求携带）→ @get:{title} 内建回退源
     let chapter_title_param = param_of(&params, body_json.as_ref(), "title");
@@ -4292,18 +4329,6 @@ async fn get_book_content_impl(
             &chapter_url,
             &ctx,
         );
-    }
-    let type_param = param_of(&params, body_json.as_ref(), "type");
-    if refresh && (book_type != 0 || source.book_source_type != 0) {
-        return Json(ReturnData::err("仅支持在线文本书的单章重新获取"));
-    }
-    if let Ok(t) = type_param.parse::<i64>() {
-        if (0..=4).contains(&t) {
-            book_type = t;
-        }
-    }
-    if refresh && book_type != 0 {
-        return Json(ReturnData::err("仅支持在线文本书的单章重新获取"));
     }
     match book_type {
         // 音频书：ruleContent 提取音频流 URL（或章节 URL 直链）→ {audioUrl, contentType}
@@ -6003,9 +6028,6 @@ async fn save_book_group_order(
 /// 参数：url（书籍链接）+ refresh（>0 强制重搜）
 /// 行为：
 /// - 书架书按 `{name}_{author}` 读取持久化候选；非空且 refresh<=0 → 原样返回
-/// - refresh>0 → 按候选 origin 重搜（书名等值过滤）并回写持久化；
-///   无候选时回退**全部启用可搜索源**精确搜索（对 legacy 空结果的超集增强——
-///   使该端点可独立驱动换源流程，不依赖 searchBookSource 先行）
 async fn get_available_book_source(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -6051,9 +6073,6 @@ async fn get_available_book_source(
         )
     };
 
-    // 持久化候选：非刷新模式**只读缓存**
-    // （旧实现「无缓存即全量并发搜索」= 首次换源必挂数分钟：177 源 × 慢源；
-    //   现语义与接口注释一致：空候选立即返回，由前端提供「用全部书源重新搜索」）
     let cached = state
         .storage
         .get_book_candidates(&namespace, &key)
@@ -6065,31 +6084,27 @@ async fn get_available_book_source(
             crate::service::search::matches_source_title(candidate, &book.name, exact)
         })
         .collect();
-    if refresh <= 0 {
+    if refresh <= 0 && !cached.is_empty() {
         return Json(ReturnData::ok(
             serde_json::to_value(cached).unwrap_or(serde_json::Value::Null),
         ));
     }
 
-    // 重搜源集合：优先候选 origin 集；无候选 → 全部启用可搜索源（超集增强）
-    let origins: std::collections::HashSet<String> =
-        cached.iter().map(|c| c.origin.clone()).collect();
-    let mut sources: Vec<crate::model::BookSource> =
+    let sources: Vec<crate::model::BookSource> =
         match state.storage.get_book_sources(&namespace).await {
             Ok(s) => s
                 .into_iter()
-                .filter(|s| s.enabled && s.search_url.is_some())
+                .filter(|source| {
+                    source.enabled
+                        && source.search_url.as_deref().is_some_and(|url| !url.trim().is_empty())
+                })
                 .collect(),
             Err(_) => return Json(ReturnData::err("系统错误")),
         };
-    if exact && !origins.is_empty() {
-        sources.retain(|s| origins.contains(&s.book_source_url));
-    }
     if sources.is_empty() {
         return Json(ReturnData::ok(serde_json::Value::Array(vec![])));
     }
 
-    // 并发精确搜索（16，同 legacy concurrentCount）
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
     let name = book.name.trim().to_string();
     let ns = namespace.clone();
@@ -6102,14 +6117,18 @@ async fn get_available_book_source(
         let storage = storage.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await;
-            crate::service::search::search_one_source(&storage, &ns, &source, &key, 1, 15)
+            crate::service::search::search_one_source_with_refresh(
+                &storage, &ns, &source, &key, 1, 15, true,
+            )
                 .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|candidate| {
-                    crate::service::search::matches_source_title(candidate, &key, exact)
+                .map(|books| {
+                    books
+                        .into_iter()
+                        .filter(|candidate| {
+                            crate::service::search::matches_source_title(candidate, &key, exact)
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .collect::<Vec<_>>()
         }));
     }
     let abort_handles: Vec<_> = handles
@@ -6128,6 +6147,8 @@ async fn get_available_book_source(
     let deadline = tokio::time::Instant::now() + budget;
     let mut rest = handles;
     let mut all: Vec<crate::service::search::SearchBook> = Vec::new();
+    let mut failed_sources = 0;
+    let mut search_timed_out = false;
     loop {
         if rest.is_empty() || all.len() >= EARLY_HITS {
             break;
@@ -6135,17 +6156,20 @@ async fn get_available_book_source(
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
             tracing::warn!("换源全量搜索超预算 {}s，返回已收集", budget.as_secs());
+            search_timed_out = true;
             break;
         }
         match tokio::time::timeout(left, futures::future::select_all(rest)).await {
             Ok((joined, _idx, remaining)) => {
                 rest = remaining;
-                if let Ok(books) = joined {
-                    all.extend(books);
+                match joined {
+                    Ok(Ok(books)) => all.extend(books),
+                    _ => failed_sources += 1,
                 }
             }
             Err(_) => {
                 tracing::warn!("换源全量搜索超预算 {}s，返回已收集", budget.as_secs());
+                search_timed_out = true;
                 break;
             }
         }
@@ -6168,6 +6192,9 @@ async fn get_available_book_source(
             ))
         })
         .collect();
+    if matched.is_empty() && (failed_sources > 0 || search_timed_out) {
+        return Json(ReturnData::err("书源搜索失败或超时，请重新搜索"));
+    }
 
     let _ = state
         .storage
@@ -12451,7 +12478,8 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(fuzzy_cached.0.data, json!([]));
+        assert!(fuzzy_cached.0.is_success, "{}", fuzzy_cached.0.error_msg);
+        assert_eq!(fuzzy_cached.0.data.as_array().unwrap().len(), 3);
         let fuzzy = get_available_book_source(
             AxumState(state.clone()),
             Query(parameters(1, 0)),
@@ -12546,6 +12574,10 @@ mod tests {
             )
             .await
             .unwrap();
+        for mut source in state.storage.get_book_sources("default").await.unwrap() {
+            source.hidden = true;
+            state.storage.save_book_source("alice", &source).await.unwrap();
+        }
         let isolated = get_available_book_source(
             AxumState(state.clone()),
             Query(private),
@@ -17318,6 +17350,7 @@ mod tests {
                     book_url: book_url.into(),
                     name: "刷新测试".into(),
                     origin: base.clone(),
+                    book_type: 8,
                     dur_chapter_index: 7,
                     dur_chapter_pos: 123,
                     dur_chapter_time: 456,
@@ -23253,6 +23286,682 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn test_switch_empty_cache_auto_search_and_refresh_all_sources() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
+        struct SourcePrivateGuard(bool);
+        impl Drop for SourcePrivateGuard {
+            fn drop(&mut self) {
+                crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                    .store(self.0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _source = SourcePrivateGuard(
+            crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                .swap(true, std::sync::atomic::Ordering::Relaxed),
+        );
+        let (state, dir) = test_state("switch-empty-cache").await;
+        let book_url = "https://book.example/auto-search";
+        let name = "自动搜索书";
+        let cache_key = "自动搜索书_作者";
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: book_url.into(),
+                    name: name.into(),
+                    author: "作者".into(),
+                    dur_chapter_index: 8,
+                    dur_chapter_pos: 222,
+                    dur_chapter_time: 456,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut sources = Vec::new();
+        let mut counters = Vec::new();
+        for number in 0..3 {
+            let body = json!({"data":[{"name":name,"author":"作者","url":format!("/book/{number}")}]})
+                .to_string();
+            let (base, counter) = serve_counted_chapter_responses(vec![(200, body)]).await;
+            let source = crate::model::BookSource {
+                book_source_url: base.clone(),
+                book_source_name: format!("源{number}"),
+                enabled: true,
+                search_url: Some(format!("{base}/search,{{\"retry\":0}}")),
+                rule_search: Some(
+                    json!({"bookList":"$.data[*]","name":"$.name","author":"$.author","bookUrl":"$.url"}),
+                ),
+                ..Default::default()
+            };
+            if number < 2 {
+                state
+                    .storage
+                    .save_book_source("default", &source)
+                    .await
+                    .unwrap();
+            }
+            let search_key = format!("{name}\u{1}1\u{1}{base}");
+            state
+                .storage
+                .put_search_cache("default", &search_key, "[]")
+                .await
+                .unwrap();
+            crate::service::health::mark_source_invalid("default", &base, "previous failure");
+            sources.push(source);
+            counters.push(counter);
+        }
+        state
+            .storage
+            .save_book_candidates("default", cache_key, &[])
+            .await
+            .unwrap();
+        let request = |refresh: i64| {
+            Some(Bytes::from(
+                json!({"url":book_url,"refresh":refresh,"exact":1}).to_string(),
+            ))
+        };
+        let first = get_available_book_source(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            request(0),
+        )
+        .await;
+        assert!(first.0.is_success, "{}", first.0.error_msg);
+        assert_eq!(first.0.data.as_array().unwrap().len(), 2);
+        for counter in &counters[..2] {
+            assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+        let cached = get_available_book_source(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            request(0),
+        )
+        .await;
+        assert_eq!(cached.0.data, first.0.data);
+        for counter in &counters[..2] {
+            assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+        state
+            .storage
+            .save_book_source("default", &sources[2])
+            .await
+            .unwrap();
+        let refreshed = get_available_book_source(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            request(1),
+        )
+        .await;
+        assert!(refreshed.0.is_success, "{}", refreshed.0.error_msg);
+        assert_eq!(refreshed.0.data.as_array().unwrap().len(), 3);
+        for counter in &counters[..2] {
+            assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
+        }
+        assert_eq!(counters[2].load(std::sync::atomic::Ordering::Relaxed), 1);
+        let saved = state
+            .storage
+            .find_book("default", book_url)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                saved.dur_chapter_index,
+                saved.dur_chapter_pos,
+                saved.dur_chapter_time
+            ),
+            (8, 222, 456)
+        );
+        cleanup(state, dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_switch_empty_cache_search_failure_is_not_empty_success() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
+        struct SourcePrivateGuard(bool);
+        impl Drop for SourcePrivateGuard {
+            fn drop(&mut self) {
+                crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                    .store(self.0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _source = SourcePrivateGuard(
+            crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                .swap(true, std::sync::atomic::Ordering::Relaxed),
+        );
+        let (state, dir) = test_state("switch-search-failure").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let book_url = "https://book.example/failure";
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: book_url.into(),
+                    name: "测试书".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut source = crate::model::BookSource {
+            book_source_url: base.clone(),
+            search_url: Some(format!("{base}/search,{{\"retry\":0}}")),
+            enabled: true,
+            rule_search: Some(json!({"bookList":"$.data[*]","name":"$.name","bookUrl":"$.url"})),
+            ..Default::default()
+        };
+        state
+            .storage
+            .save_book_source("default", &source)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let response = get_available_book_source(
+                AxumState(state.clone()),
+                Query(HashMap::from([("url".into(), book_url.into())])),
+                HeaderMap::new(),
+                None,
+            )
+            .await;
+            assert!(!response.0.is_success);
+            assert_eq!(response.0.error_msg, "书源搜索失败或超时，请重新搜索");
+        }
+        source.enabled = false;
+        state
+            .storage
+            .save_book_source("default", &source)
+            .await
+            .unwrap();
+        let empty = get_available_book_source(
+            AxumState(state.clone()),
+            Query(HashMap::from([("url".into(), book_url.into())])),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert!(empty.0.is_success);
+        assert_eq!(empty.0.data, json!([]));
+        cleanup(state, dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_switch_search_invalid_json_preserves_cache() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
+        struct SourcePrivateGuard(bool);
+        impl Drop for SourcePrivateGuard {
+            fn drop(&mut self) {
+                crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                    .store(self.0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _source = SourcePrivateGuard(
+            crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                .swap(true, std::sync::atomic::Ordering::Relaxed),
+        );
+        let (state, dir) = test_state("switch-invalid-json").await;
+        let name = "测试书";
+        let book_url = "https://book.example/json-failure";
+        let (base, requests) = serve_counted_chapter_responses(vec![
+            (200, "failed".into()),
+            (200, r#"{"data":["#.into()),
+            (200, r#"{"data":[]}"#.into()),
+            (
+                200,
+                json!({"data":[{"name":name,"url":"/book/recovered"}]}).to_string(),
+            ),
+        ])
+        .await;
+        let source = crate::model::BookSource {
+            book_source_url: base.clone(),
+            search_url: Some(format!("{base}/search,{{\"retry\":0}}")),
+            enabled: true,
+            rule_search: Some(json!({"bookList":"$.data[*]","name":"$.name","bookUrl":"$.url"})),
+            ..Default::default()
+        };
+        state
+            .storage
+            .save_book_source("default", &source)
+            .await
+            .unwrap();
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: book_url.into(),
+                    name: name.into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let previous = vec![crate::service::search::SearchBook {
+            book_url: format!("{base}/book/cached"),
+            origin: base.clone(),
+            name: name.into(),
+            ..Default::default()
+        }];
+        let candidate_key = format!("{name}_");
+        let search_key = format!("{name}\u{1}1\u{1}{base}");
+        let cached_json = serde_json::to_string(&previous).unwrap();
+        state
+            .storage
+            .save_book_candidates("default", &candidate_key, &previous)
+            .await
+            .unwrap();
+        state
+            .storage
+            .put_search_cache("default", &search_key, &cached_json)
+            .await
+            .unwrap();
+        for count in 1..=2 {
+            let response = get_available_book_source(
+                AxumState(state.clone()),
+                Query(HashMap::from([
+                    ("url".into(), book_url.into()),
+                    ("refresh".into(), "1".into()),
+                ])),
+                HeaderMap::new(),
+                None,
+            )
+            .await;
+            assert!(!response.0.is_success);
+            assert_eq!(response.0.error_msg, "书源搜索失败或超时，请重新搜索");
+            assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), count);
+            assert!(crate::service::health::is_source_invalid("default", &base));
+            assert_eq!(
+                state
+                    .storage
+                    .get_search_cache("default", &search_key, 600_000)
+                    .await
+                    .unwrap(),
+                Some(cached_json.clone())
+            );
+            assert_eq!(
+                state
+                    .storage
+                    .get_book_candidates("default", &candidate_key)
+                    .await
+                    .unwrap()[0]
+                    .book_url,
+                previous[0].book_url
+            );
+        }
+        let empty = get_available_book_source(
+            AxumState(state.clone()),
+            Query(HashMap::from([
+                ("url".into(), book_url.into()),
+                ("refresh".into(), "1".into()),
+            ])),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert!(empty.0.is_success);
+        assert_eq!(empty.0.data, json!([]));
+        assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert!(!crate::service::health::is_source_invalid("default", &base));
+        assert_eq!(
+            state
+                .storage
+                .get_search_cache("default", &search_key, 600_000)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("[]")
+        );
+        assert!(state
+            .storage
+            .get_book_candidates("default", &candidate_key)
+            .await
+            .unwrap()
+            .is_empty());
+        let recovered = get_available_book_source(
+            AxumState(state.clone()),
+            Query(HashMap::from([("url".into(), book_url.into())])),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert!(recovered.0.is_success);
+        assert_eq!(
+            recovered.0.data[0]["bookUrl"],
+            format!("{base}/book/recovered")
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 4);
+        cleanup(state, dir).await;
+    }
+
+    async fn serve_counted_chapter_responses(
+        replies: Vec<(u16, String)>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = requests.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for _ in 0..20 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buffer = [0u8; 4096];
+                let _ = socket.read(&mut buffer).await;
+                let index = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (status, body) = &replies[index.min(replies.len() - 1)];
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    #[tokio::test]
+    async fn test_get_book_content_legacy_flags_and_invalid_types() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
+        struct SourcePrivateGuard(bool);
+        impl Drop for SourcePrivateGuard {
+            fn drop(&mut self) {
+                crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                    .store(self.0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _source = SourcePrivateGuard(
+            crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                .swap(true, std::sync::atomic::Ordering::Relaxed),
+        );
+        let (state, dir) = test_state("legacy-book-flags").await;
+        let source_url = "https://flags.example";
+        let book_url = "https://flags.example/book";
+        let chapter_url = "https://flags.example/chapter";
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: source_url.into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let cache_index = crate::util::md5::chapter_url_hash(chapter_url);
+        state
+            .storage
+            .cache_chapter_content("default", book_url, cache_index, "首章", "缓存正文")
+            .await
+            .unwrap();
+        for value in [0, 8, 8 | 16, 8 | 512 | 1024] {
+            let book = crate::model::Book {
+                book_url: book_url.into(),
+                origin: source_url.into(),
+                name: "测试书".into(),
+                book_type: value,
+                dur_chapter_index: 7,
+                dur_chapter_pos: 123,
+                ..Default::default()
+            };
+            state.storage.upsert_book("default", &book).await.unwrap();
+            let response = get_book_content(
+                AxumState(state.clone()),
+                Query(HashMap::new()),
+                HeaderMap::new(),
+                Some(Bytes::from(
+                    json!({"url":chapter_url,"bookUrl":book_url,"bookSource":source_url,"cache":1})
+                        .to_string(),
+                )),
+            )
+            .await;
+            assert!(
+                response.0.is_success,
+                "type={value}: {}",
+                response.0.error_msg
+            );
+            assert_eq!(response.0.data, json!({"content":"缓存正文"}));
+            let saved = state
+                .storage
+                .find_book("default", book_url)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.book_type, value);
+            assert_eq!((saved.dur_chapter_index, saved.dur_chapter_pos), (7, 123));
+        }
+        for (value, expected) in [
+            (4, "videoUrl"),
+            (32, "audioUrl"),
+            (64, "images"),
+            (128, "downloadUrl"),
+        ] {
+            let base =
+                mini_server(r#"<div class="p"><audio src="/a.mp3"></audio><img src="/i.jpg"></div>"#)
+                    .await;
+            state.storage.save_book_source("default", &crate::model::BookSource {
+                book_source_url: base.clone(),
+                rule_content: Some(json!({"content":if value == 64 { "div.p img@src" } else { "div.p audio@src" }})),
+                ..Default::default()
+            }).await.unwrap();
+            state
+                .storage
+                .upsert_book(
+                    "default",
+                    &crate::model::Book {
+                        book_url: book_url.into(),
+                        origin: base.clone(),
+                        book_type: value | 16,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let response = get_book_content(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(),
+                Some(Bytes::from(json!({"url":format!("{base}/chapter"),"bookUrl":book_url,"bookSource":base,"cache":1}).to_string()))).await;
+            assert!(
+                response.0.is_success,
+                "type={value}: {}",
+                response.0.error_msg
+            );
+            assert!(!response.0.data[expected].is_null(), "{}", response.0.data);
+        }
+        for (value, message) in [
+            (8 | 256, "仅支持在线文本书的单章重新获取"),
+            (2048, "不支持的书籍类型"),
+            (8 | 32, "不支持的书籍类型"),
+            (-1, "不支持的书籍类型"),
+        ] {
+            state
+                .storage
+                .upsert_book(
+                    "default",
+                    &crate::model::Book {
+                        book_url: book_url.into(),
+                        origin: source_url.into(),
+                        book_type: value,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let response = refresh_book_content(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(),
+                Some(Bytes::from(json!({"url":chapter_url,"bookUrl":book_url,"bookSource":source_url,"retryCount":0}).to_string()))).await;
+            assert_eq!(response.0.error_msg, message);
+        }
+        cleanup(state, dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_chapter_json_source_failure_retry_and_cache_preservation() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
+        struct SourcePrivateGuard(bool);
+        impl Drop for SourcePrivateGuard {
+            fn drop(&mut self) {
+                crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                    .store(self.0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _source = SourcePrivateGuard(
+            crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                .swap(true, std::sync::atomic::Ordering::Relaxed),
+        );
+        let (mut state, dir) = test_state("json-chapter-retry").await;
+        state.storage.config.cache_chapter_content = true;
+        let failure = "获取数据失败，请稍后再试，错误详情：failed";
+        for (scenario, replies, retries, expected_requests, succeeds) in [
+            (
+                "recovered",
+                vec![
+                    (200, json!({"content":failure}).to_string()),
+                    (200, json!({"content":"恢复正文"}).to_string()),
+                ],
+                1,
+                2,
+                true,
+            ),
+            (
+                "exhausted",
+                vec![(200, json!({"content":failure}).to_string())],
+                1,
+                2,
+                false,
+            ),
+            (
+                "no-retries",
+                vec![(200, json!({"content":failure}).to_string())],
+                0,
+                1,
+                false,
+            ),
+            (
+                "temporary-http",
+                vec![
+                    (503, "busy".into()),
+                    (200, json!({"content":"恢复正文"}).to_string()),
+                ],
+                1,
+                2,
+                true,
+            ),
+            (
+                "permanent-http",
+                vec![(404, "not found".into())],
+                2,
+                1,
+                false,
+            ),
+            (
+                "empty-second-page",
+                vec![
+                    (200, json!({"content":"首段","next":"/second"}).to_string()),
+                    (200, json!({"content":""}).to_string()),
+                    (
+                        200,
+                        json!({"content":"恢复正文","next":"/second"}).to_string(),
+                    ),
+                    (200, json!({"content":"第二段"}).to_string()),
+                ],
+                1,
+                4,
+                true,
+            ),
+        ] {
+            let (base, requests) = serve_counted_chapter_responses(replies).await;
+            let book_url = format!("https://book.example/{scenario}");
+            let chapter_url = format!("{base}/chapter,{{\"retry\":0}}");
+            let cache_index = crate::util::md5::chapter_url_hash(&chapter_url);
+            state
+                .storage
+                .save_book_source(
+                    "default",
+                    &crate::model::BookSource {
+                        book_source_url: base.clone(),
+                        rule_content: Some(json!({"content":"$.content","nextContentUrl":"$.next"})),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            state
+                .storage
+                .upsert_book(
+                    "default",
+                    &crate::model::Book {
+                        book_url: book_url.clone(),
+                        origin: base.clone(),
+                        name: "JSON章节".into(),
+                        book_type: 8 | 16,
+                        dur_chapter_index: 9,
+                        dur_chapter_pos: 321,
+                        dur_chapter_time: 12345,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            state
+                .storage
+                .cache_chapter_content("default", &book_url, cache_index, "第一章", "原缓存正文")
+                .await
+                .unwrap();
+            let response = refresh_book_content(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(),
+                Some(Bytes::from(json!({"url":chapter_url,"bookUrl":book_url,"bookSource":base,"retryCount":retries,"index":0}).to_string()))).await;
+            assert_eq!(
+                response.0.is_success, succeeds,
+                "{scenario}: {}",
+                response.0.error_msg
+            );
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::Relaxed),
+                expected_requests,
+                "{scenario}"
+            );
+            let cache = state
+                .storage
+                .get_chapter_content("default", &book_url, cache_index)
+                .await
+                .unwrap()
+                .unwrap();
+            if succeeds {
+                assert!(cache.contains("恢复正文"), "{scenario}: {cache}");
+                assert!(!cache.contains(failure));
+                if scenario == "empty-second-page" {
+                    assert!(cache.contains("第二段"));
+                    assert!(!cache.contains("首段"));
+                }
+            } else {
+                assert_eq!(cache, "原缓存正文", "{scenario}");
+                assert!(response.0.error_msg.contains("已保留原缓存"));
+            }
+            let book = state
+                .storage
+                .find_book("default", &book_url)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (
+                    book.book_type,
+                    book.dur_chapter_index,
+                    book.dur_chapter_pos,
+                    book.dur_chapter_time
+                ),
+                (24, 9, 321, 12345)
+            );
+        }
+        cleanup(state, dir).await;
     }
 
     /// 非文本书 getBookContent 分派（构造 audio/comic/video/file 书源规则 → 断言返回结构）：

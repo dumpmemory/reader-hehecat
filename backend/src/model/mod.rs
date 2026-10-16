@@ -4,6 +4,7 @@ pub mod book;
 pub mod book_chapter;
 pub mod book_group;
 pub mod book_source;
+pub mod book_type;
 pub mod bookmark;
 pub mod cookie;
 pub mod http_tts;

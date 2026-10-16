@@ -176,7 +176,7 @@ compose 默认挂 `deploy/storage/`(容器内 `/storage/storage`), 内含:
 { "url": "https://example.invalid/book/123", "refresh": 1, "exact": 0 }
 ```
 
-第二例用于 `/reader3/getAvailableBookSource`: `refresh=0` 只读当前模式的候选缓存; `refresh=1` 重新搜索。模糊模式扫描全部启用且可搜索的书源(受现有并发/时间预算限制), 不局限于旧精确候选来源; 精确模式保留原有「已有候选时只重搜这些来源」行为。模糊与精确缓存互不覆盖, 同一书源的不同书籍候选也会分别显示。只搜索不改变阅读进度, 选定候选后才执行换源。
+第二例用于 `/reader3/getAvailableBookSource`: `refresh=0` 优先读取当前模式的非空候选缓存; 缓存为空或匹配过滤后为空时自动搜索一次, 不直接把空缓存当作无搜索结果。`refresh=1` 强制重新搜索。两种模式都扫描全部启用且可搜索的书源, 绕过旧搜索缓存和临时失效标记, 不局限于旧候选来源; 受16并发、默认60秒总预算限制。失败或超时且无匹配结果返回业务错误并保留旧候选, 前端提供手动重试; 不无限自动重试。模糊与精确缓存互不覆盖, 同一书源的不同书籍候选也会分别显示。只搜索不改变阅读进度, 选定候选后才执行换源。
 
 ### 单章重新获取接口
 
@@ -241,10 +241,10 @@ GET 同样会回源并可能写回章节缓存, 是**有副作用的兼容方法
 
 响应统一使用 `isSuccess` / `errorMsg` / `data` envelope。**业务错误也可能返回 HTTP 200**, 必须判断 `isSuccess`, 失败时读取 `errorMsg`, 不要仅凭 HTTP 状态或 curl 退出码判断成功。一般失败返回如 `{ "isSuccess": false, "errorMsg": "书源不存在", "data": null }`; 未登录或 token 无效/过期时返回 `{ "isSuccess": false, "errorMsg": "请登录后使用", "data": "NEED_LOGIN" }`。
 
-- `url` 也可使用 `chapterUrl`; `bookUrl` 必填。只支持在线文本书, 不支持本地文件及音频/漫画/视频书。
+- `url` 也可使用 `chapterUrl`; `bookUrl` 必填。只支持在线文本书, 不支持本地文件及音频/漫画/视频书。兼容旧书架的 `type=0` 与 Legado 位标记文本 `type=8` (包括更新失败标记 `8|16`), 无需删除并重新加入书架; 本地标记仍禁止回源刷新。音频32、图片64、下载128与旧0–4类型分别解析, 未知或冲突类型拒绝, 不再截断为视频。
 - `retryCount` 是首次尝试之外的重试次数, 0 表示只抓取一次、2 表示最多尝试三次; 省略则用 `READER_CHAPTER_RETRIES`。阅读刷新弹窗默认 2, 可选 0–5, 当前选择仅保留在本次阅读页面。
 - 成功返回 `{ "isSuccess": true, "errorMsg": "", "data": { "content": "新正文" } }`; 只替换当前用户、当前书、当前章节的缓存, 不变更目录、其他章节或阅读进度。
-- 抓取失败、空正文或源站错误提示不会覆盖旧缓存。`READER_APP_CACHECHAPTERCONTENT=false` 时返回新正文但不写服务端缓存。
+- 抓取失败、空正文或源站错误提示不会覆盖旧缓存。分页中的任意空页或错误页都会让整章重试, 不会把前半章误当成功缓存。前端遇到缺少 `content` 的响应(如误返回 `videoUrl`)明确报错, 不再默认为空正文。`READER_APP_CACHECHAPTERCONTENT=false` 时返回新正文但不写服务端缓存。
 - 现有 `POST/GET /reader3/getBookContent` 同样支持 `refresh=1` / `true` 和 `retryCount`; 不传 `refresh` 时仍优先用有效缓存, 发现上述错误提示缓存则自动回源。
 - 章节重试从本章第一页重新执行规则与分页抓取, 指数退避 200ms 起, 总时限 110s。底层 `READER_HTTP_RETRIES` 和书源 URL option `retry` 是独立的传输层重试, 因此一次章节尝试可能包含多次 HTTP 请求。
 - 110s 是协作式抓取预算: 同步书源 JS 不能强行中断, 但超时结果不接受为成功; 写回在事务内检查期限, 提交前超时回滚, 一旦开始提交则等待数据库确认结果。

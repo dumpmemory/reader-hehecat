@@ -84,7 +84,7 @@ function BookDetail({ book, onAdded }: { book: SearchBook; onAdded?: (saved: Boo
   /** 换源成功后书籍身份(bookUrl/origin)改变, 详情与目录查询随之切到新身份 */
   const [identity, setIdentity] = React.useState<{ bookUrl: string; origin: string } | null>(null);
   const [switchOpen, setSwitchOpen] = React.useState(false);
-  /** true = 让后端用全部书源重新搜索候选(慢), 作为独立 query key 与缓存结果区分 */
+  /** true = 让后端用全部启用且可搜索的书源重新搜索候选(慢), 作为独立 query key 与缓存结果区分 */
   const [deepSearch, setDeepSearch] = React.useState(false);
   const [switchExact, setSwitchExact] = React.useState(true);
   /** 本次会话里刚加入书架: 后端用户存储读取有数秒缓存, 书架列表不会立刻反映 */
@@ -132,6 +132,17 @@ function BookDetail({ book, onAdded }: { book: SearchBook; onAdded?: (saved: Boo
     retry: false,
     enabled: switchOpen && exactInShelf,
   });
+
+  const refreshAvailable = () => {
+    if (deepSearch) void available.refetch();
+    else setDeepSearch(true);
+  };
+
+  const sourceLoadingMessage = exactInShelf
+    ? deepSearch
+      ? "正在搜索书源(最多约 60 秒)…"
+      : "正在检查缓存/搜索书源(最多约 60 秒)…"
+    : "正在读取可用书源";
 
   const sourcesQuery = useQuery({
     queryKey: ["sourcesLite"],
@@ -392,7 +403,7 @@ function BookDetail({ book, onAdded }: { book: SearchBook; onAdded?: (saved: Boo
                   className="ml-auto"
                   loading={available.isFetching}
                   disabled={!inShelf || changeSource.isPending}
-                  onClick={() => { if (deepSearch) void available.refetch(); else setDeepSearch(true); }}
+                  onClick={refreshAvailable}
                 >
                   {available.isFetching ? null : <RefreshCw aria-hidden />}
                   重新搜索
@@ -410,19 +421,22 @@ function BookDetail({ book, onAdded }: { book: SearchBook; onAdded?: (saved: Boo
                   未入架: 换源只作用于本次预览, 不会加入书架
                 </p>
               ) : null}
-              {(exactInShelf ? available.isLoading : sourcesQuery.isLoading) ? (
-                <p className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
-                  <Spinner size="sm" label="读取可用书源" />
-                  正在读取可用书源
+              {(exactInShelf ? available.isLoading || available.isFetching : sourcesQuery.isLoading) ? (
+                <p role="status" className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
+                  <Spinner size="sm" label={sourceLoadingMessage} />
+                  {sourceLoadingMessage}
                 </p>
               ) : exactInShelf && available.isError ? (
-                <p className="mt-2 text-xs text-danger">
-                  {humanizeError(errorMessage(available.error, "读取可用书源失败"))}
-                </p>
+                <div role="alert" className="mt-2 flex flex-col items-start gap-2 text-xs text-danger">
+                  <p>候选书源检查/搜索失败：{humanizeError(errorMessage(available.error, "请手动重新搜索"))}</p>
+                  <Button size="sm" variant="secondary" disabled={busy} onClick={refreshAvailable}>
+                    重试搜索
+                  </Button>
+                </div>
               ) : candidates.length === 0 && deadOrigins.length === 0 ? (
                 <p className="mt-2 text-xs text-muted-foreground">
                   {exactInShelf
-                    ? "当前模式暂无候选，请点击重新搜索"
+                    ? "未找到符合当前匹配方式的候选书源，可手动重新搜索"
                     : "搜索结果只命中当前源, 暂无其他书源"}
                 </p>
               ) : (

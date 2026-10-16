@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { proxiedAssetUrl } from "@/lib/asset";
 import { ApiError, parseWith, post, type ApiRequestConfig } from "@/lib/api-client";
+import { plainIntro } from "@/lib/text";
 import {
   bookChapterListSchema,
   bookSchema,
@@ -39,7 +40,7 @@ export const bookContentSchema = z.union([
   z.string().transform((content) => ({ title: "", content })),
   z.object({
     title: z.string().default(""),
-    content: z.string().default(""),
+    content: z.string(),
     nextContentUrl: z.string().optional(),
   }),
 ]);
@@ -85,6 +86,15 @@ export async function getChapterList(
   return parseWith(bookChapterListSchema, data);
 }
 
+function isSourceErrorContent(content: string): boolean {
+  const text = plainIntro(content);
+  if (Array.from(text).length > 512) {
+    return false;
+  }
+  const compact = text.replace(/\s+/gu, "").replace(/[。.！!]+$/u, "");
+  return /^获取数据失败[，,。.:：]*请稍后再试[，,。.:：]*错误详情[:：][A-Za-z0-9_.:()/-]+$/u.test(compact);
+}
+
 function bookContentPayload(
   url: string,
   index: number,
@@ -118,7 +128,16 @@ async function requestBookContent(
     bookContentPayload(url, index, options),
     { timeout: FETCH_TIMEOUT, ...config },
   );
-  return parseWith(bookContentSchema, data);
+  const content = parseWith(bookContentSchema, data);
+  if (content.content.trim() === "") {
+    throw new ApiError(endpoint === "/refreshBookContent"
+      ? "章节正文为空，已保留原内容"
+      : "章节正文为空");
+  }
+  if (isSourceErrorContent(content.content)) {
+    throw new ApiError("书源返回了获取数据失败提示，而非章节正文");
+  }
+  return content;
 }
 
 /** warp 契约: url = 章节页 URL (chapterUrl), index 仅用于回写书架进度; Kotlin 旧形 bookUrl+index 已废 */
@@ -137,11 +156,7 @@ export async function refreshBookContent(
   options?: Omit<BookContentOptions, "refresh" | "cache">,
   config?: ApiRequestConfig,
 ): Promise<BookContent> {
-  const content = await requestBookContent("/refreshBookContent", url, index, options, config);
-  if (content.content.trim() === "") {
-    throw new ApiError("章节正文为空，已保留原内容");
-  }
-  return content;
+  return requestBookContent("/refreshBookContent", url, index, options, config);
 }
 
 /** 保存阅读进度到书架(章节内位置由后端按章节列表写入) */

@@ -12,7 +12,8 @@ use url::Url;
 use crate::model::BookSource;
 use crate::parser::js::JsBridge;
 use crate::parser::rule::{
-    apply, apply_with_vars, parse_rule, push_js_context, resolve_get, RuleKind, RuleVars,
+    apply, apply_with_vars, parse_rule, push_js_context, resolve_get, validate_json_path_input,
+    RuleKind, RuleVars,
 };
 use crate::service::crawler;
 use crate::storage::Storage;
@@ -570,21 +571,36 @@ pub async fn search_one_source(
     page: i64,
     timeout_secs: u64,
 ) -> Result<Vec<SearchBook>> {
+    search_one_source_with_refresh(storage, ns, source, key, page, timeout_secs, false).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn search_one_source_with_refresh(
+    storage: &Storage,
+    ns: &str,
+    source: &BookSource,
+    key: &str,
+    page: i64,
+    timeout_secs: u64,
+    refresh: bool,
+) -> Result<Vec<SearchBook>> {
     // F2/EG5 配套：600s 内已标记失效的书源跳过请求
-    if crate::service::health::is_source_invalid(ns, source.book_source_url.as_str()) {
+    if !refresh && crate::service::health::is_source_invalid(ns, source.book_source_url.as_str()) {
         return Ok(vec![]);
     }
     // 10min 搜索结果缓存: 同关键词+页+源重搜免回源 (连载新书容忍 10min 延迟)
     let cache_key = format!("{key}\u{1}{page}\u{1}{}", source.book_source_url);
-    if let Ok(Some(json)) = storage.get_search_cache(ns, &cache_key, 600_000).await {
-        if let Ok(books) = serde_json::from_str::<Vec<SearchBook>>(&json) {
-            return Ok(books);
+    if !refresh {
+        if let Ok(Some(json)) = storage.get_search_cache(ns, &cache_key, 600_000).await {
+            if let Ok(books) = serde_json::from_str::<Vec<SearchBook>>(&json) {
+                return Ok(books);
+            }
         }
     }
     match search_one_source_impl(storage, ns, source, key, page, timeout_secs).await {
         Ok(v) => {
             crate::service::health::clear_source_invalid(ns, &source.book_source_url);
-            if !v.is_empty() {
+            if refresh || !v.is_empty() {
                 if let Ok(json) = serde_json::to_string(&v) {
                     let _ = storage.put_search_cache(ns, &cache_key, &json).await;
                 }
@@ -742,6 +758,9 @@ async fn search_one_source_impl(
         )
         .await?
     };
+    if resp.status >= 400 {
+        return Err(anyhow::anyhow!("书源搜索返回 HTTP {}", resp.status));
+    }
     let base = resp.url.clone();
     // bodyJs：对响应体执行 JS 后作为新响应体
     let body = apply_body_js(
@@ -768,6 +787,13 @@ async fn search_one_source_impl(
         &url,
         Some(&bridge),
     );
+    if books.is_empty() {
+        let (list_rule, _) = strip_list_rule_prefix(&book_list_rule);
+        if parse_rule(&list_rule).kind == RuleKind::JsonPath {
+            validate_json_path_input(&body)
+                .map_err(|error| anyhow::anyhow!("书源搜索 JSON 解析失败: {error}"))?;
+        }
+    }
 
     // 书源使用统计：搜索命中（结果非空）→ use_count+1 / use_ts 刷新；
     // 计数失败仅记 debug 日志，不影响搜索流程（搜索/换源共用此入口）

@@ -1343,6 +1343,22 @@ fn parse_json_value(text: &str) -> serde_json::Result<serde_json::Value> {
     <serde_json::Value as serde::Deserialize>::deserialize(de)
 }
 
+pub(crate) fn validate_json_path_input(text: &str) -> serde_json::Result<()> {
+    match parse_json_value(text) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            if text.lines().any(|line| {
+                let line = line.trim();
+                line.starts_with('{') && line.ends_with('}') && parse_json_value(line).is_ok()
+            }) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 /// 内容是否为 JSON（legacy AnalyzeRule.setContent 的 isJSON 判定，
 /// StringExtensions.kt:16 首字符 `{`/`[` + 尾字符配对；此处再经整体解析确认，
 /// 比纯首尾括号检查更严——非 JSON 花括号文本不误触发裸键强制 JsonPath）。
@@ -2647,6 +2663,22 @@ mod tests {
         let html = "前文\n{\"data\":{\"name\":\"内嵌\"}}\n后文";
         let r = apply("$.data.name", html);
         assert_eq!(r, vec!["内嵌".to_string()]);
+    }
+
+    #[test]
+    fn test_json_path_input_validation() {
+        for text in [
+            r#"{"data":[]}"#,
+            "[]",
+            "null",
+            "前文\n{\"data\":[]}\n后文",
+            "前文\n{\"data\":[{\"name\":\"书\"}]}\n后文",
+        ] {
+            assert!(validate_json_path_input(text).is_ok(), "{text}");
+        }
+        for text in ["", "failed", r#"{"data":["#, "前文\n{invalid}\n后文"] {
+            assert!(validate_json_path_input(text).is_err(), "{text}");
+        }
     }
 
     #[test]

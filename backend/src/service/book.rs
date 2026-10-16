@@ -1340,9 +1340,10 @@ async fn analyze_content_impl(
         if is_source_error_content(&content) {
             return Err(ChapterContentError::SourceFailure.into());
         }
-        if !content.is_empty() {
-            parts.push(content);
+        if content.trim().is_empty() {
+            return Err(ChapterContentError::Empty.into());
         }
+        parts.push(content);
 
         let rule: ContentRule = source
             .rule_content

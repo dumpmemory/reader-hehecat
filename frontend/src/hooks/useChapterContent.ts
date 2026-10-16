@@ -4,6 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 
 import { LOCAL_ORIGIN } from "@/hooks/useBookshelf";
 import { proxiedAssetUrl } from "@/lib/asset";
+import { isLocalBookType, normalizeBookContentType } from "@/lib/book-type";
 import { getBookContent, refreshBookContent, type BookContent } from "@/services/book";
 import { activeReplaceRules, applyReplaceRules, useReplaceRules } from "@/services/purify";
 import type { BookChapter } from "@/types/api";
@@ -171,13 +172,15 @@ export function useChapterContent(
     queryKey: ["content", bookUrl, index] as const,
     bookUrl,
     index,
+    bookType,
     url: chapterUrl ?? "",
     options: { bookSourceUrl: origin, bookUrl, title: chapterTitle },
     supported: bookUrl.trim() !== ""
       && Number.isInteger(index) && index >= 0
       && (chapterCount === undefined || index < chapterCount)
       && chapterUrl !== undefined && chapterUrl.trim() !== "" && !isVolume
-      && bookType === 0 && origin !== LOCAL_ORIGIN
+      && normalizeBookContentType(bookType) === 0 && !isLocalBookType(bookType)
+      && origin !== LOCAL_ORIGIN
       && !isLocalContentUrl(bookUrl) && !isLocalContentUrl(chapterUrl),
   }), [bookUrl, index, chapterUrl, chapterTitle, isVolume, chapterCount, origin, bookType]);
   const currentTarget = useRef<typeof refreshTarget | null>(refreshTarget);

@@ -43,7 +43,7 @@ export interface SwitchSourceDialogProps {
 }
 
 /**
- * 换源面板: 列出该书在其它书源的候选(后端按书名/作者从缓存匹配), 选中即切源并失效相关缓存.
+ * 换源面板: 列出该书在其它书源的候选(后端优先读取缓存, 缓存为空时自动搜索), 选中即切源并失效相关缓存.
  * 阅读器与书架详情共用; 传 chapterIndex 时可按当前章逐源比对(章节名 + 字数),
  * 用于"本章正文有问题(缺字/防盗/乱码)时选一个正常源".
  */
@@ -60,7 +60,7 @@ export function SwitchSourceDialog({
 }: SwitchSourceDialogProps) {
   const queryClient = useQueryClient();
   const bookUrl = book?.bookUrl ?? "";
-  /** 缓存候选可能过期/为空: 允许用全部书源重新搜索一次(慢) */
+  /** 缓存候选可能过期: 允许手动用全部启用且可搜索的书源重新搜索(慢) */
   const [forceSearch, setForceSearch] = React.useState(false);
   const [exact, setExact] = React.useState(true);
   const probeRun = React.useRef(0);
@@ -275,16 +275,19 @@ export function SwitchSourceDialog({
               </Button>
             </div>
           ) : candidates.isLoading || candidates.isFetching ? (
-            <p className="py-6 text-center text-sm text-muted-foreground">
-              {forceSearch ? "正在重新搜索书源(最多约 60 秒)…" : "正在获取候选书源…"}
+            <p role="status" className="py-6 text-center text-sm text-muted-foreground">
+              {forceSearch ? "正在搜索书源(最多约 60 秒)…" : "正在检查缓存/搜索书源(最多约 60 秒)…"}
             </p>
           ) : candidates.isError ? (
-            <p className="py-6 text-center text-sm text-danger">
-              {humanizeError(errorMessage(candidates.error, "读取候选失败，请重新搜索"))}
-            </p>
+            <div role="alert" className="flex flex-col items-center gap-3 py-6 text-center text-sm text-danger">
+              <p>候选书源检查/搜索失败：{humanizeError(errorMessage(candidates.error, "请手动重新搜索"))}</p>
+              <Button size="sm" variant="secondary" disabled={applySwitch.isPending} onClick={refreshCandidates}>
+                重试搜索
+              </Button>
+            </div>
           ) : list.length === 0 ? (
             <div className="flex flex-col items-center gap-3 py-6 text-center text-sm text-muted-foreground">
-              <p>{forceSearch ? "没有找到符合当前匹配方式的书" : "当前模式暂无候选，请点击重新搜索"}</p>
+              <p>未找到符合当前匹配方式的候选书源，可手动重新搜索</p>
             </div>
           ) : (
             <>
