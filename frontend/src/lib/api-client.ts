@@ -170,6 +170,53 @@ export async function post<T>(
   return response.data as T;
 }
 
+export async function postFile(
+  url: string,
+  data: unknown,
+  config?: ApiRequestConfig,
+): Promise<AxiosResponse<Blob>> {
+  const response = await apiClient.request<Blob>({
+    ...config,
+    url,
+    method: "POST",
+    data,
+    responseType: "blob",
+    validateStatus: () => true,
+  });
+  const contentType = String(response.headers["content-type"] ?? "").toLowerCase();
+  if (contentType.includes("json")) {
+    let body: unknown;
+    try {
+      body = JSON.parse(await response.data.text());
+    } catch {
+      body = null;
+    }
+    if (isApiEnvelope(body)) {
+      const message = envelopeMessage(body, "下载失败");
+      if (body.data === NEED_LOGIN || response.status === 401) {
+        dispatchUnauthorized(message);
+        throw new UnauthorizedError(message);
+      }
+      if (!body.isSuccess) {
+        throw new ApiError(message);
+      }
+    }
+    if (response.status !== 401) {
+      throw new ApiError(response.status >= 200 && response.status < 300
+        ? "下载响应不是有效文件"
+        : `下载失败 (HTTP ${String(response.status)})`);
+    }
+  }
+  if (response.status === 401) {
+    dispatchUnauthorized("请登录后使用");
+    throw new UnauthorizedError("请登录后使用");
+  }
+  if (response.status < 200 || response.status >= 300) {
+    throw new ApiError(`下载失败 (HTTP ${String(response.status)})`);
+  }
+  return response;
+}
+
 /**
  * 递归把显式 null 归一成 undefined (对象里直接丢键, 数组里原位替换):
  * warp 后端 serde 对 Option 字段输出 null, 而 zod 的 .optional()/.default() 只接受

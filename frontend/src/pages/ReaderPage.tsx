@@ -2,6 +2,7 @@ import { CircleAlert, LibraryBig, Link2Off } from "lucide-react";
 import * as React from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
+import { BookDownloadDialog, getBookDownloadDisabledReason } from "@/components/book/BookDownloadDialog";
 import { AnnotationsDrawer } from "@/components/reader/AnnotationsDrawer";
 import {
   AddBookmarkDialog,
@@ -44,8 +45,10 @@ import { useReaderTheme } from "@/hooks/useReaderTheme";
 import { useToc } from "@/hooks/useToc";
 import { useTts } from "@/hooks/useTts";
 import { humanizeError } from "@/lib/errors";
+import { normalizeBookContentType } from "@/lib/book-type";
 import { BOOKS_QUERY_KEY, errorMessage } from "@/hooks/useBookshelf";
 import { saveBook } from "@/services/bookshelf";
+import type { BookExportFormat } from "@/services/export";
 import { SwitchSourceDialog } from "@/components/book/SwitchSourceDialog";
 import { createBookmark, type Bookmark } from "@/services/bookmarks";
 import {
@@ -117,6 +120,12 @@ export default function ReaderPage() {
     refreshChapters,
   } = useBookData(bookUrl, bookSourceHint);
   const [tocRefreshing, setTocRefreshing] = React.useState(false);
+  const [downloadTarget, setDownloadTarget] = React.useState<{ bookUrl: string; format: BookExportFormat } | null>(null);
+  const [downloadBookUrl, setDownloadBookUrl] = React.useState(bookUrl);
+  if (downloadBookUrl !== bookUrl) {
+    setDownloadBookUrl(bookUrl);
+    setDownloadTarget(null);
+  }
   const chapterTitles = React.useMemo(() => chapters.map((chapter) => chapter.title), [chapters]);
 
   /** 换源面板直接打开: 未入架书在面板里给显式「加入书架」入口, 不再静默入架 */
@@ -209,6 +218,13 @@ export default function ReaderPage() {
   const chapter = chapters[progress.index];
   const chapterOrigin = bookSourceUrl ?? book?.origin;
   const chapterBookType = shelfBook?.type ?? book?.type;
+  const downloadDisabledReason = getBookDownloadDisabledReason(inShelf, normalizeBookContentType(chapterBookType));
+  const handleDownloadBook = (format: BookExportFormat) => {
+    if (downloadDisabledReason !== undefined || book === undefined || book.bookUrl !== bookUrl) {
+      return;
+    }
+    setDownloadTarget({ bookUrl, format });
+  };
   const content = useChapterContent(
     bookUrl,
     progress.index,
@@ -724,6 +740,21 @@ export default function ReaderPage() {
         reversed={toc.reversed}
         onToggleReversed={toc.toggleReversed}
         onSelect={toc.selectChapter}
+        onDownloadBook={handleDownloadBook}
+        downloadDisabledReason={downloadDisabledReason}
+      />
+      <BookDownloadDialog
+        open={downloadTarget?.bookUrl === bookUrl}
+        onOpenChange={(open) => {
+          if (!open) setDownloadTarget(null);
+        }}
+        book={book.bookUrl !== bookUrl ? null : {
+          bookUrl,
+          name: book.name,
+          type: chapterBookType,
+          inShelf,
+        }}
+        format={downloadTarget?.format ?? "txt"}
       />
       <BookmarksDrawer
         open={bookmarksOpen}

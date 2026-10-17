@@ -2,6 +2,7 @@ import { BookMarked, CheckSquare, Download, Ellipsis, Info, Square, Trash2 } fro
 import * as React from "react";
 import { useNavigate } from "react-router-dom";
 
+import { getBookDownloadDisabledReason } from "@/components/book/BookDownloadDialog";
 import {
   CoverImage,
   DropdownMenu,
@@ -13,6 +14,8 @@ import {
   cn,
 } from "@/components/ui";
 import { bookCover, bookGroupNames, readerPath } from "@/hooks/useBookshelf";
+import { normalizeBookContentType } from "@/lib/book-type";
+import type { BookExportFormat } from "@/services/export";
 import type { Book, BookGroup } from "@/types/api";
 
 /** grid=封面网格(封面 + 居中标题/作者两行); list=行卡(封面 + 书名 + 作者·分组 + 引言) */
@@ -33,6 +36,7 @@ export interface BookCardProps {
   /** 请求删除(由页面统一确认后执行) */
   /** 后台缓存整书 (warp cacheBookSSE); 本地书不显示 */
   onCacheBook?: (book: Book) => void;
+  onDownloadBook?: (book: Book, format: BookExportFormat) => void;
   onDelete?: (book: Book) => void;
   /** 设为读完: 进度推进到最后一章 */
   onMarkRead?: (book: Book) => void;
@@ -58,10 +62,22 @@ export function BookCard({
   onDelete,
   onMarkRead,
   onCacheBook,
+  onDownloadBook,
   className,
 }: BookCardProps) {
   const navigate = useNavigate();
   const [menuOpen, setMenuOpen] = React.useState(false);
+  const pendingDownload = React.useRef<BookExportFormat | null>(null);
+  const downloadReasonId = React.useId();
+  const downloadDisabledReason = getBookDownloadDisabledReason(true, normalizeBookContentType(book.type));
+
+  const handleDownload = (format: BookExportFormat) => {
+    if (downloadDisabledReason !== undefined || onDownloadBook === undefined) {
+      return;
+    }
+    pendingDownload.current = format;
+    setMenuOpen(false);
+  };
 
   const unread = book.totalChapterNum - 1 - book.durChapterIndex;
   const progressPct =
@@ -139,7 +155,19 @@ export function BookCard({
           <Ellipsis aria-hidden />
         </IconButton>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" side="top" className="min-w-36">
+      <DropdownMenuContent
+        align="end"
+        side="top"
+        className="min-w-36"
+        onCloseAutoFocus={(event) => {
+          const format = pendingDownload.current;
+          if (format !== null) {
+            event.preventDefault();
+            pendingDownload.current = null;
+            onDownloadBook?.(book, format);
+          }
+        }}
+      >
         <DropdownMenuItem onSelect={() => onShowInfo?.(book)}>
           <Info aria-hidden />
           书籍详情
@@ -148,12 +176,37 @@ export function BookCard({
           <BookMarked aria-hidden />
           设为读完
         </DropdownMenuItem>
-              {book.bookUrl.startsWith("local://") ? null : (
-                <DropdownMenuItem onSelect={() => onCacheBook?.(book)}>
-                  <Download aria-hidden />
-                  缓存本书
-                </DropdownMenuItem>
-              )}
+        {book.bookUrl.startsWith("local://") ? null : (
+          <DropdownMenuItem onSelect={() => onCacheBook?.(book)}>
+            <Download aria-hidden />
+            缓存本书
+          </DropdownMenuItem>
+        )}
+        {onDownloadBook !== undefined ? (
+          <>
+            <DropdownMenuItem
+              disabled={downloadDisabledReason !== undefined}
+              aria-describedby={downloadDisabledReason !== undefined ? downloadReasonId : undefined}
+              onSelect={() => handleDownload("txt")}
+            >
+              <Download aria-hidden />
+              下载 TXT
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={downloadDisabledReason !== undefined}
+              aria-describedby={downloadDisabledReason !== undefined ? downloadReasonId : undefined}
+              onSelect={() => handleDownload("epub")}
+            >
+              <Download aria-hidden />
+              下载 EPUB
+            </DropdownMenuItem>
+            {downloadDisabledReason !== undefined ? (
+              <p id={downloadReasonId} className="max-w-56 px-2.5 py-1.5 text-xs leading-relaxed text-muted-foreground">
+                {downloadDisabledReason}
+              </p>
+            ) : null}
+          </>
+        ) : null}
         <DropdownMenuSeparator />
         <DropdownMenuItem variant="danger" onSelect={() => onDelete?.(book)}>
           <Trash2 aria-hidden />

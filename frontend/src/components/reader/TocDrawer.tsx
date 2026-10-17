@@ -1,4 +1,4 @@
-import { ArrowLeftRight, RotateCw, Search } from "lucide-react";
+import { ArrowLeftRight, Download, RotateCw, Search } from "lucide-react";
 import * as React from "react";
 import { useSearchParams } from "react-router-dom";
 import { Virtuoso } from "react-virtuoso";
@@ -30,6 +30,7 @@ import {
   type CacheStreamHandlers,
 } from "@/services/cache";
 import type { BookChapter } from "@/types/api";
+import type { BookExportFormat } from "@/services/export";
 
 /** 命中片段高亮: 按关键字切分, 关键字部分包 <mark>(不用 innerHTML, 无注入面) */
 function highlight(text: string, query: string): React.ReactNode {
@@ -99,6 +100,8 @@ export interface TocDrawerProps {
   refreshingToc?: boolean;
   /** 打开换源面板(本地书不传): 本章出问题时从目录直接换源 */
   onSwitchSource?: () => void;
+  onDownloadBook?: (format: BookExportFormat) => void;
+  downloadDisabledReason?: string;
 }
 
 /** 目录抽屉: 左侧滑出 (书名 + 作者抬头), 虚拟列表承载数千章节, 当前章节高亮, 支持倒序 */
@@ -113,10 +116,21 @@ export function TocDrawer({
   onToggleReversed,
   onSelect,
   onSwitchSource,
+  onDownloadBook,
+  downloadDisabledReason,
   totalChapterNum,
   onRefreshToc,
   refreshingToc = false,
 }: TocDrawerProps) {
+  const pendingDownload = React.useRef<BookExportFormat | null>(null);
+  const downloadReasonId = React.useId();
+  const handleDownload = (format: BookExportFormat) => {
+    if (downloadDisabledReason !== undefined || onDownloadBook === undefined) {
+      return;
+    }
+    pendingDownload.current = format;
+    onOpenChange(false);
+  };
   const ordered = React.useMemo(
     () => (reversed ? [...chapters].reverse() : chapters),
     [chapters, reversed],
@@ -310,7 +324,17 @@ export function TocDrawer({
 
   return (
     <Drawer side="left" open={open} onOpenChange={onOpenChange}>
-      <DrawerContent className="w-80 max-w-[85vw]">
+      <DrawerContent
+        className="w-80 max-w-[85vw]"
+        onCloseAutoFocus={(event) => {
+          const format = pendingDownload.current;
+          if (format !== null) {
+            event.preventDefault();
+            pendingDownload.current = null;
+            onDownloadBook?.(format);
+          }
+        }}
+      >
         <DrawerHeader className="p-5">
           <DrawerTitle className="font-display text-lg leading-tight font-semibold">
             {bookName}
@@ -343,6 +367,37 @@ export function TocDrawer({
               )}
             </div>
           )}
+          {onDownloadBook !== undefined ? (
+            <div className="mt-3 space-y-2">
+              <div className="flex gap-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="flex-1"
+                  disabled={downloadDisabledReason !== undefined}
+                  aria-describedby={downloadDisabledReason !== undefined ? downloadReasonId : undefined}
+                  onClick={() => handleDownload("txt")}
+                >
+                  <Download aria-hidden />
+                  下载 TXT
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="flex-1"
+                  disabled={downloadDisabledReason !== undefined}
+                  aria-describedby={downloadDisabledReason !== undefined ? downloadReasonId : undefined}
+                  onClick={() => handleDownload("epub")}
+                >
+                  <Download aria-hidden />
+                  下载 EPUB
+                </Button>
+              </div>
+              {downloadDisabledReason !== undefined ? (
+                <p id={downloadReasonId} className="text-xs leading-relaxed text-muted-foreground">{downloadDisabledReason}</p>
+              ) : null}
+            </div>
+          ) : null}
           <TocSearchField value={query} onChange={setQuery} />
           {totalChapterNum !== undefined && totalChapterNum > chapters.length ? (
             <p className="mt-2 rounded-lg border border-accent/30 bg-surface px-2.5 py-1.5 text-xs text-accent">

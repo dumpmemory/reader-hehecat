@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import * as React from "react";
 import { useNavigate } from "react-router-dom";
+import { BookDownloadDialog, getBookDownloadDisabledReason } from "@/components/book/BookDownloadDialog";
 import { BookInfoDialog } from "@/components/shelf/BookInfoDialog";
 import { BookCard, type BookCardLayout } from "@/components/shelf/BookCard";
 import { ImportBookDialog } from "@/components/shelf/ImportBookDialog";
@@ -40,7 +41,9 @@ import {
   toast,
 } from "@/components/ui";
 import { humanizeError } from "@/lib/errors";
+import { normalizeBookContentType } from "@/lib/book-type";
 import { startCacheBookStream } from "@/services/cache";
+import type { BookExportFormat } from "@/services/export";
 import {
   GROUP_ALL,
   buildShelfGroups,
@@ -119,6 +122,9 @@ export default function ShelfPage() {
   const [moveOpen, setMoveOpen] = React.useState(false);
   const [moveTarget, setMoveTarget] = React.useState("");
   const [importOpen, setImportOpen] = React.useState(false);
+  const [downloadTarget, setDownloadTarget] = React.useState<{ book: Book; format: BookExportFormat } | null>(null);
+  const downloadShelfBook = books.find((item) => item.bookUrl === downloadTarget?.book.bookUrl);
+  const downloadBook = downloadShelfBook ?? downloadTarget?.book;
   const { groups } = useBookGroups();
   const shelfGroups = React.useMemo(() => buildShelfGroups(books, groups), [books, groups]);
 
@@ -178,6 +184,15 @@ export default function ShelfPage() {
   const startReading = (book: Book) => {
     setInfoOpen(false);
     navigate(readerPath(book.bookUrl, book.durChapterIndex));
+  };
+
+  const handleDownloadBook = (target: Book, format: BookExportFormat) => {
+    const reason = getBookDownloadDisabledReason(true, normalizeBookContentType(target.type));
+    if (reason !== undefined) {
+      toast.info(reason);
+      return;
+    }
+    setDownloadTarget({ book: target, format });
   };
 
   const confirmDelete = () => {
@@ -267,6 +282,7 @@ export default function ShelfPage() {
       onDelete={(target) => setPendingDelete([target])}
       onMarkRead={(target) => markRead.mutate(target)}
       onCacheBook={handleCacheBook}
+      onDownloadBook={handleDownloadBook}
     />
   );
 
@@ -474,6 +490,20 @@ export default function ShelfPage() {
       />
 
       <ImportBookDialog open={importOpen} onOpenChange={setImportOpen} />
+
+      <BookDownloadDialog
+        open={downloadTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setDownloadTarget(null);
+        }}
+        book={downloadBook === undefined ? null : {
+          bookUrl: downloadBook.bookUrl,
+          name: downloadBook.name,
+          type: downloadBook.type,
+          inShelf: downloadShelfBook !== undefined,
+        }}
+        format={downloadTarget?.format ?? "txt"}
+      />
 
       <Dialog
         open={pendingDelete !== null}

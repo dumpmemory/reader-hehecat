@@ -4995,7 +4995,12 @@ async fn collect_export_chapters(
                     .ok()
                     .flatten()
                 {
-                    Some(c) if !c.trim().is_empty() => Ok(c),
+                    Some(c)
+                        if !c.trim().is_empty()
+                            && !crate::service::book::is_source_error_content(&c) =>
+                    {
+                        Ok(c)
+                    }
                     _ => crate::service::book::analyze_content(
                         &ns,
                         &chapter_url,
@@ -18919,7 +18924,7 @@ mod tests {
     /// exportBook：书源书（目录 → 逐章正文，复用规则引擎）
     #[tokio::test]
     async fn test_export_book_web_api() {
-        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
+        let _guard = export_source_test_guard();
         let (state, dir) = test_state("exportweb").await;
         let base_url = serve_bodies(vec![
             r#"<ul class="chapters"><li><a href="/ch1.html">第一章</a></li><li><a href="/ch2.html">第二章</a></li></ul>"#.to_string(),
@@ -18989,7 +18994,7 @@ mod tests {
     /// failedChapters 列表（percent 编码 JSON），成功章节照常导出
     #[tokio::test]
     async fn test_export_book_web_failed_chapters_warning() {
-        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1
+        let _guard = export_source_test_guard();
         let (state, dir) = test_state("exportwarn").await;
         // 第二章指向死端口（无监听）→ 抓章失败；其余正常（路径寻址保证并发序确定性）
         let toc_html = r#"<ul class="chapters"><li><a href="/ch1.html">第一章</a></li><li><a href="http://127.0.0.1:1/ch2.html">第二章（死端口）</a></li><li><a href="/ch3.html">第三章</a></li></ul>"#;
@@ -19089,6 +19094,329 @@ mod tests {
         assert!(!txt.contains("死端口"), "失败章不应出现在导出正文");
 
         cleanup(state, dir).await;
+    }
+
+    struct ExportSourceTestGuard {
+        _ssrf: crate::service::crawler::SsrfAllowGuard,
+        source_allow_private: bool,
+        retry_env: [(&'static str, Option<std::ffi::OsString>); 2],
+    }
+
+    impl Drop for ExportSourceTestGuard {
+        fn drop(&mut self) {
+            for (name, previous) in &self.retry_env {
+                if let Some(previous) = previous {
+                    std::env::set_var(name, previous);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+            crate::service::crawler::SOURCE_ALLOW_PRIVATE.store(
+                self.source_allow_private,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn export_source_test_guard() -> ExportSourceTestGuard {
+        let ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
+        let guard = ExportSourceTestGuard {
+            _ssrf: ssrf,
+            source_allow_private: crate::service::crawler::SOURCE_ALLOW_PRIVATE
+                .swap(true, std::sync::atomic::Ordering::Relaxed),
+            retry_env: ["READER_CHAPTER_RETRIES", "READER_HTTP_RETRIES"]
+                .map(|name| (name, std::env::var_os(name))),
+        };
+        std::env::set_var("READER_CHAPTER_RETRIES", "1");
+        std::env::set_var("READER_HTTP_RETRIES", "0");
+        guard
+    }
+
+    async fn assert_export_book_source_error_cache(
+        tag: &str,
+        book_type: i64,
+        recovered: bool,
+        has_valid_cache: bool,
+    ) {
+        use tower::ServiceExt as _;
+        let _guard = export_source_test_guard();
+        let (mut state, dir) = test_state(tag).await;
+        state.storage.config.secure = false;
+        state.storage.config.cache_chapter_content = true;
+        let failure = "获取数据失败，请稍后再试，错误详情：failed";
+        let failure_html = format!("<div class=\"content\">{failure}</div>");
+        let replies = if recovered {
+            vec![
+                (200, failure_html.clone()),
+                (200, "<div class=\"content\">回源有效正文。</div>".into()),
+                (200, failure_html.clone()),
+                (200, "<div class=\"content\">回源有效正文。</div>".into()),
+            ]
+        } else {
+            vec![(200, failure_html)]
+        };
+        let (chapter_base, requests) = serve_counted_chapter_responses(replies).await;
+        let chapter_titles = ["第一章", "第二章", "第三章"];
+        let chapter_urls: Vec<String> = (1..=3)
+            .map(|number| format!("{chapter_base}/chapter{number},{{\"retry\":0}}"))
+            .collect();
+        let toc: Vec<Value> = chapter_titles
+            .iter()
+            .zip(&chapter_urls)
+            .enumerate()
+            .map(|(index, (title, url))| json!({"index": index, "title": title, "url": url}))
+            .collect();
+        let toc_json = serde_json::to_string(&toc).unwrap();
+        let source_url = serve_bodies(vec![json!({"chapters": toc}).to_string()]).await;
+        let base = source_url.trim_end_matches("/sources.json");
+        let book_url = format!("{base}/book/export-source-error");
+        let toc_url = format!("{base}/toc,{{\"retry\":0}}");
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: base.into(),
+                    rule_toc: Some(json!({
+                        "chapterList": "$.chapters[*]",
+                        "chapterName": "$.title",
+                        "chapterUrl": "$.url",
+                    })),
+                    rule_content: Some(json!({"content": "div.content@text"})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: book_url.clone(),
+                    toc_url: toc_url.clone(),
+                    name: "错误缓存导出回归".into(),
+                    origin: base.into(),
+                    book_type,
+                    total_chapter_num: 3,
+                    dur_chapter_title: Some("先前章节".into()),
+                    dur_chapter_index: 7,
+                    dur_chapter_pos: 123,
+                    dur_chapter_time: 456,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .cache_toc("default", &book_url, &toc_url, &toc_json)
+            .await
+            .unwrap();
+        let cached_error = if book_type == 24 {
+            format!("<p>{failure}</p>")
+        } else {
+            failure.to_string()
+        };
+        assert!(crate::service::book::is_source_error_content(&cached_error));
+        let valid_contents = ["缓存正文二：他叹了口气说：获取数据失败。", "缓存正文三。"];
+        for (index, chapter_url) in chapter_urls.iter().enumerate() {
+            let content = if has_valid_cache && index > 0 {
+                valid_contents[index - 1]
+            } else {
+                &cached_error
+            };
+            state
+                .storage
+                .cache_chapter_content(
+                    "default",
+                    &book_url,
+                    crate::util::md5::chapter_url_hash(chapter_url),
+                    chapter_titles[index],
+                    content,
+                )
+                .await
+                .unwrap();
+        }
+        let cached_before = state
+            .storage
+            .list_cached_chapters("default", &book_url)
+            .await
+            .unwrap();
+        let book_before = serde_json::to_value(
+            state
+                .storage
+                .find_book("default", &book_url)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let toc_snapshot_query =
+            "SELECT toc_url, chapters_json, updated_at FROM toc_cache WHERE user_namespace = 'default' AND book_url = ?1";
+        let toc_before: (String, String, i64) = sqlx::query_as(toc_snapshot_query)
+            .bind(&book_url)
+            .fetch_one(&state.storage.pool)
+            .await
+            .unwrap();
+        let app = router(state.storage.config.clone(), state.storage.clone());
+        for (format_index, format) in ["txt", "epub"].into_iter().enumerate() {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                app.clone().oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/reader3/exportBook")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"url": book_url, "format": format}).to_string(),
+                        ))
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if !has_valid_cache && !recovered {
+                assert_eq!(response.headers()["content-type"], "application/json");
+                assert!(response.headers().get("content-disposition").is_none());
+                assert!(response.headers().get("X-Export-Warning").is_none());
+                let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let error: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(error["isSuccess"], false, "{error}");
+                assert_eq!(error["errorMsg"], "没有可导出的章节");
+            } else {
+                assert!(response.headers().get("content-disposition").is_some());
+                if recovered {
+                    assert!(response.headers().get("X-Export-Warning").is_none());
+                } else {
+                    let warning = response.headers()["X-Export-Warning"].to_str().unwrap();
+                    assert!(warning.is_ascii());
+                    let warning: Value = serde_json::from_str(&percent_decode(warning)).unwrap();
+                    let failed = warning["failedChapters"].as_array().unwrap();
+                    assert_eq!(failed.len(), 1, "{warning}");
+                    assert_eq!(failed[0]["title"], "第一章");
+                    assert_eq!(failed[0]["index"], 0);
+                    let error = failed[0]["error"].as_str().unwrap();
+                    assert!(error.contains("获取正文失败"), "{error}");
+                    assert!(error.contains("共尝试 2 次"), "{error}");
+                }
+                let expected: Vec<(&str, &str)> = if recovered {
+                    vec![
+                        ("第一章", "回源有效正文。"),
+                        ("第二章", valid_contents[0]),
+                        ("第三章", valid_contents[1]),
+                    ]
+                } else {
+                    vec![("第二章", valid_contents[0]), ("第三章", valid_contents[1])]
+                };
+                assert_eq!(
+                    response.headers()["content-type"],
+                    if format == "txt" {
+                        "text/plain; charset=utf-8"
+                    } else {
+                        "application/epub+zip"
+                    }
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let exported = if format == "txt" {
+                    String::from_utf8(bytes.to_vec()).unwrap()
+                } else {
+                    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+                    assert_eq!(
+                        archive
+                            .file_names()
+                            .filter(|name| name.starts_with("OEBPS/chap_"))
+                            .count(),
+                        expected.len()
+                    );
+                    let mut chapters = String::new();
+                    for chapter_index in 0..expected.len() {
+                        std::io::Read::read_to_string(
+                            &mut archive
+                                .by_name(&format!("OEBPS/chap_{chapter_index:04}.xhtml"))
+                                .unwrap(),
+                            &mut chapters,
+                        )
+                        .unwrap();
+                    }
+                    chapters
+                };
+                assert!(!exported.contains(failure), "{exported}");
+                if !recovered {
+                    assert!(!exported.contains("第一章"), "{exported}");
+                }
+                let mut previous_position = 0;
+                for (title, content) in expected {
+                    let title_position = previous_position
+                        + exported[previous_position..]
+                            .find(title)
+                            .expect("TOC 标题顺序");
+                    let content_position = title_position
+                        + exported[title_position..].find(content).expect("有效正文");
+                    previous_position = content_position + content.len();
+                }
+            }
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::Relaxed),
+                (format_index + 1) * if has_valid_cache { 2 } else { 6 }
+            );
+            assert_eq!(
+                state
+                    .storage
+                    .list_cached_chapters("default", &book_url)
+                    .await
+                    .unwrap(),
+                cached_before
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    state
+                        .storage
+                        .find_book("default", &book_url)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                book_before
+            );
+            let toc_after: (String, String, i64) = sqlx::query_as(toc_snapshot_query)
+                .bind(&book_url)
+                .fetch_one(&state.storage.pool)
+                .await
+                .unwrap();
+            assert_eq!(toc_after, toc_before);
+        }
+        cleanup(state, dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_export_book_source_error_cache_recovered() {
+        for book_type in [8, 24] {
+            assert_export_book_source_error_cache(
+                &format!("export-error-recovered-{book_type}"),
+                book_type,
+                true,
+                true,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_export_book_source_error_cache_partial_warning() {
+        assert_export_book_source_error_cache("export-error-partial", 24, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_export_book_source_error_cache_all_failed() {
+        assert_export_book_source_error_cache("export-error-all-failed", 8, false, false).await;
     }
 
     /// P2：GBK 导出不可映射字符——不再静默替换为 ?：正文转义 NCR（&#x…;），
